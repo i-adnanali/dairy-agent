@@ -7,9 +7,9 @@ health events. The agent answers questions about the farm **and takes real
 actions** — but every state-changing action is gated behind an explicit human
 confirmation.
 
-![](/Users/adnanali/Downloads/welcome_state.png)
-![](/Users/adnanali/Downloads/digest_table.png)
-![](/Users/adnanali/Downloads/chart_hover_demo.gif)
+![Welcome state of the dairy agent chat UI](docs/images/welcome_state.png)
+![Digest table returned by the agent](docs/images/digest_table.png)
+![Milk-yield chart with hover interaction](docs/images/chart_hover_demo.gif)
 
 It is built as an npm-workspaces monorepo:
 
