@@ -12,3 +12,6 @@ dist/
 
 # os
 .DS_Store
+
+# JetBrains IDE
+.idea/
