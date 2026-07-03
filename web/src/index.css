@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+}
+
+/* compact markdown inside assistant bubbles */
+.prose-chat p {
+  margin: 0 0 0.5rem;
+}
+.prose-chat p:last-child {
+  margin-bottom: 0;
+}
+.prose-chat ul,
+.prose-chat ol {
+  margin: 0 0 0.5rem;
+  padding-left: 1.25rem;
+}
+.prose-chat li {
+  margin: 0.125rem 0;
+}
+.prose-chat strong {
+  font-weight: 600;
+}
+.prose-chat code {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.25rem;
+  font-size: 0.85em;
+}
+.prose-chat table {
+  width: 100%;
+  margin: 0.25rem 0 0.75rem;
+  border-collapse: collapse;
+  font-size: 0.85em;
+  display: block;
+  overflow-x: auto;
+}
+.prose-chat thead {
+  background: rgba(0, 0, 0, 0.04);
+}
+.prose-chat th,
+.prose-chat td {
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  padding: 0.35rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.prose-chat th {
+  font-weight: 600;
+}
+.prose-chat td {
+  white-space: normal;
+}

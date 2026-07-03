@@ -1,0 +1,20 @@
+{
+  "name": "dairy-agent",
+  "private": true,
+  "version": "1.0.0",
+  "description": "AI agent for dairy farm management (read/write tool split with human-in-the-loop confirmation).",
+  "workspaces": [
+    "shared",
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "build:shared": "npm run build -w shared",
+    "seed": "npm run seed -w server",
+    "dev": "npm run build:shared && concurrently -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
+    "typecheck": "npm run build:shared && npm run typecheck -w server && npm run typecheck -w web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

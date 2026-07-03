@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+
+# env
+.env
+
+# sqlite database + WAL sidecar files
+*.db
+*.db-shm
+*.db-wal
+
+# os
+.DS_Store
