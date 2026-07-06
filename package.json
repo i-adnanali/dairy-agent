@@ -7,13 +7,16 @@
   "workspaces": [
     "shared",
     "server",
-    "web"
+    "web-react",
+    "web-angular"
   ],
   "scripts": {
     "build:shared": "npm run build -w shared",
     "seed": "npm run seed -w server",
-    "dev": "npm run build:shared && concurrently -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
-    "typecheck": "npm run build:shared && npm run typecheck -w server && npm run typecheck -w web"
+    "dev": "npm run build:shared && concurrently -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web-react\"",
+    "dev:angular": "npm run build:shared && concurrently -n server,angular -c blue,red \"npm run dev -w server\" \"npm run start -w web-angular\"",
+    "build:angular": "npm run build:shared && npm run build -w web-angular",
+    "typecheck": "npm run build:shared && npm run typecheck -w server && npm run typecheck -w web-react"
   },
   "devDependencies": {
     "concurrently": "^9.1.0"
