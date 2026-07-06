@@ -11,23 +11,35 @@ confirmation.
 ![Digest table returned by the agent](docs/images/digest_table.png)
 ![Milk-yield chart with hover interaction](docs/images/chart_hover_demo.gif)
 
-It is built as an npm-workspaces monorepo:
+It is built as an npm-workspaces monorepo with **two interchangeable frontends**
+(React and Angular) that talk to the same, unmodified server over the identical
+`POST /api/chat` contract:
 
 ```
 dairy-agent/
-  shared/   # TypeScript types shared by server + web (single source of truth)
-  server/   # Express + Anthropic SDK orchestrator, SQLite, tools, agent loop
-  web/       # React + Vite + Tailwind + Recharts frontend
+  shared/       # TypeScript types shared by server + web (single source of truth)
+  server/       # Express + Anthropic SDK orchestrator, SQLite, tools, agent loop
+  web-react/    # React 18 + Vite + Tailwind + Recharts frontend
+  web-angular/  # Angular 22 (standalone, zoneless) + Tailwind + ng2-charts frontend
 ```
+
+Both frontends are feature-equivalent; pick either. The Angular port and its
+architecture are documented in [docs/ANGULAR_PORT.md](docs/ANGULAR_PORT.md).
 
 ## Tech stack
 
-- **Server:** Node ≥ 20, TypeScript, Express, official Anthropic SDK
+- **Server:** Node, TypeScript, Express, official Anthropic SDK
   (`@anthropic-ai/sdk`), non-streaming.
 - **Database:** SQLite via `better-sqlite3` (synchronous, zero-config).
-- **Frontend:** React 18 + TypeScript + Vite, Tailwind CSS, Recharts.
+- **Frontend (React):** React 18 + TypeScript + Vite, Tailwind CSS, Recharts.
+- **Frontend (Angular):** Angular 22 standalone + zoneless, signals, Tailwind CSS,
+  `ng2-charts` (Chart.js), `marked` + `DOMPurify` for markdown.
 - **Model:** default `claude-sonnet-4-6` (override with `ANTHROPIC_MODEL`); falls
   back to the latest Sonnet if the configured model string is rejected.
+
+> **Node version:** the React frontend runs on Node ≥ 20, but the **Angular 22**
+> frontend requires Node `^22.22.3 || ^24.15.0 || >=26`. Use a satisfying version
+> (e.g. via `nvm`) when working on `web-angular/`.
 
 ## Setup & run
 
@@ -41,11 +53,14 @@ cp .env.example .env        # then edit .env and add ANTHROPIC_API_KEY
 # 3. create + seed the SQLite database (idempotent: drop + recreate)
 npm run seed -w server      # creates server/dairy.db
 
-# 4. run server (:4000) + web (:5173) together; Vite proxies /api -> :4000
+# 4a. run server (:4000) + React web (:5173); Vite proxies /api -> :4000
 npm run dev
+
+# 4b. or run server (:4000) + Angular web (:4200); ng proxies /api -> :4000
+npm run dev:angular
 ```
 
-Then open <http://localhost:5173>.
+Then open <http://localhost:5173> (React) or <http://localhost:4200> (Angular).
 
 `GET /api/health` returns `{ status: "ok", seeded: true, anthropicKey: <bool> }`
 once the DB is seeded. If you start the server before seeding, the health check
@@ -56,8 +71,10 @@ of failing obscurely.
 
 - `npm run seed -w server` — recreate and seed `server/dairy.db` (fixed RNG, so
   the data — and the milk-yield trend — is reproducible).
-- `npm run typecheck` — typecheck shared + server + web.
+- `npm run typecheck` — typecheck shared + server + web-react.
+- `npm run build:angular` — build shared + the Angular frontend.
 - `npm test -w server` — sanity tests for the digest shaper.
+- `npm test -w web-angular` — Vitest unit tests for the Angular frontend.
 
 ## How this demonstrates assistant → agent
 
