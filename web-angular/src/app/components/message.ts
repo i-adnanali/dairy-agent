@@ -1,14 +1,14 @@
 import { ChangeDetectionStrategy, Component, computed, input } from '@angular/core';
 import type { TurnItem } from '../core/turn-item.type';
+import { ChartCard } from './chart-card';
+import { MarkdownView } from './markdown-view';
 import { ToolCallChip } from './tool-call-chip';
 
 // Port of web-react/src/components/Message.tsx
-// NOTE: assistant text is rendered as plain text here; markdown (ngx-markdown +
-// DOMPurify) and the ChartCard slot are wired in Phase 3.
 @Component({
   selector: 'app-message',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ToolCallChip],
+  imports: [ToolCallChip, ChartCard, MarkdownView],
   template: `
     @if (item().role === 'user') {
       <div class="flex justify-end">
@@ -24,7 +24,7 @@ import { ToolCallChip } from './tool-call-chip';
           <div
             class="prose-chat max-w-[85%] rounded-2xl rounded-bl-sm border border-farm-200 bg-white px-4 py-3 text-sm text-farm-900 shadow-sm"
           >
-            {{ a.text }}
+            <app-markdown-view [text]="a.text" />
           </div>
         }
 
@@ -39,10 +39,7 @@ import { ToolCallChip } from './tool-call-chip';
         @if (a.datasets.length > 0) {
           <div class="w-full space-y-3">
             @for (ds of a.datasets; track ds.datasetId) {
-              <!-- ChartCard wired in Phase 3 -->
-              <div class="rounded-xl border border-farm-200 bg-white p-4 text-xs text-farm-500">
-                {{ ds.scopeLabel }} — {{ ds.interval }}ly yield ({{ ds.points.length }} points)
-              </div>
+              <app-chart-card [dataset]="ds" />
             }
           </div>
         }
