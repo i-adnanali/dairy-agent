@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run build:shared
+      - run: npm run typecheck            # shared + server + web-react
+      - run: npm test -w server           # pure shaper tests, no DB/key
+      - run: npm run build -w web-react
+      - run: npm test -w web-angular      # Vitest (jsdom); CI=true is auto-set
+      - run: npm run build -w web-angular

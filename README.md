@@ -1,6 +1,7 @@
 # Dairy Farm Management Agent
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![CI](https://github.com/i-adnanali/dairy-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/i-adnanali/dairy-agent/actions/workflows/ci.yml)
 
 A working AI **agent** for managing a dairy farm's animals, milk yields, feed, and
 health events. The agent answers questions about the farm **and takes real
