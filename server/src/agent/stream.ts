@@ -22,7 +22,11 @@ import { buildSystemPrompt } from './systemPrompt';
 const DEFAULT_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
 const FALLBACK_MODEL = 'claude-sonnet-4-5';
 const MAX_TOKENS = 1500;
-const MAX_ITERATIONS = 8;
+// Matches loop.ts (8); overridable only to make the cap path testable.
+const MAX_ITERATIONS = Number(process.env.AGENT_MAX_ITERATIONS) || 8;
+
+const ITERATION_CAP_MESSAGE =
+  'This request got too involved for me to complete in one go. Could you narrow it down or break it into smaller steps?';
 
 type AnyMessage = Anthropic.MessageParam;
 type ContentBlock = Anthropic.ContentBlock;
@@ -339,7 +343,18 @@ export async function runAgentStream({
     emit({ type: EventType.STEP_FINISHED, stepName } as BaseEvent);
   }
 
-  // Iteration cap - refined into a graceful, friendly finish in phase 4.
+  // Iteration cap hit: a graceful, friendly finish - NOT an error (Decision 3).
+  // Stream the friendly text as a normal assistant message so the frontend
+  // treats it as a completion, not a failure state.
+  const capMsgId = `msg_${randomUUID()}`;
+  emit({ type: EventType.TEXT_MESSAGE_START, messageId: capMsgId, role: 'assistant' } as BaseEvent);
+  emit({
+    type: EventType.TEXT_MESSAGE_CONTENT,
+    messageId: capMsgId,
+    delta: ITERATION_CAP_MESSAGE,
+  } as BaseEvent);
+  emit({ type: EventType.TEXT_MESSAGE_END, messageId: capMsgId } as BaseEvent);
+  msgs.push({ role: 'assistant', content: ITERATION_CAP_MESSAGE });
   emitHistory(emit, msgs);
   emit({
     type: EventType.RUN_FINISHED,
