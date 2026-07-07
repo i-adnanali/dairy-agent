@@ -2,12 +2,17 @@ import { randomUUID } from 'node:crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import { EventType } from '@ag-ui/core';
 import type { BaseEvent } from '@ag-ui/core';
-import type { Approval, Dataset } from '@dairy/shared';
-import { DAIRY_DATASET_EVENT, DAIRY_MESSAGES_EVENT } from '@dairy/shared';
+import type { Approval, Dataset, PendingWrite } from '@dairy/shared';
+import {
+  DAIRY_DATASET_EVENT,
+  DAIRY_MESSAGES_EVENT,
+  DAIRY_PENDING_EVENT,
+} from '@dairy/shared';
 import {
   ALL_TOOLS,
   READ_EXECUTORS,
   READ_TOOL_NAMES,
+  WRITE_EXECUTORS,
   WRITE_TOOL_NAMES,
   guardIds,
 } from '../tools';
@@ -215,17 +220,20 @@ function runReads(
 }
 
 /**
- * Phase 2: text + read tools streamed as AG-UI events, looping up to
- * MAX_ITERATIONS. Write tools are not handled yet (phase 3).
+ * Text + read tools + write approval, streamed as AG-UI events, looping up to
+ * MAX_ITERATIONS. Writes pause the run with a RUN_FINISHED interrupt outcome
+ * (Decision 2); the client resumes with a fresh run carrying approvals.
  */
 export async function runAgentStream({
   threadId,
   runId,
   messages,
+  approvals,
   emit,
 }: RunStreamArgs): Promise<void> {
   const system = buildSystemPrompt(todayISO());
   const msgs: AnyMessage[] = [...messages];
+  let remainingApprovals = [...(approvals ?? [])];
 
   emit({ type: EventType.RUN_STARTED, threadId, runId } as BaseEvent);
 
@@ -271,8 +279,64 @@ export async function runAgentStream({
       continue;
     }
 
-    // Writes require human approval - implemented in phase 3.
-    throw new Error('Write tools are not supported yet (phase 3).');
+    // --- There are writes -> need human approval ---
+    const unresolved = writes.filter(
+      (w) => !remainingApprovals.some((a) => a.toolUseId === w.id),
+    );
+
+    if (unresolved.length > 0) {
+      const cards: PendingWrite[] = writes.map((w) =>
+        WRITE_EXECUTORS[w.name].buildCard(w.id, (w.input ?? {}) as Record<string, unknown>),
+      );
+      emit({ type: EventType.STEP_FINISHED, stepName } as BaseEvent);
+      // Persist history so the client can resend the assistant tool_use turn,
+      // then pause the run for approval (Decision 2). The pending cards travel
+      // over a CUSTOM event (the reliable app channel) and are mirrored in the
+      // RUN_FINISHED interrupt outcome for protocol correctness.
+      emitHistory(emit, msgs);
+      emit({ type: EventType.CUSTOM, name: DAIRY_PENDING_EVENT, value: cards } as BaseEvent);
+      emit({
+        type: EventType.RUN_FINISHED,
+        threadId,
+        runId,
+        outcome: {
+          type: 'interrupt',
+          interrupts: cards.map((c) => ({
+            id: c.toolUseId,
+            reason: 'tool_call',
+            toolCallId: c.toolUseId,
+            metadata: c as unknown as Record<string, unknown>,
+          })),
+        },
+      } as BaseEvent);
+      return;
+    }
+
+    // --- All writes have an approval decision -> execute / decline ---
+    const writeResults: Anthropic.ToolResultBlockParam[] = [];
+    for (const w of writes) {
+      const input = (w.input ?? {}) as Record<string, unknown>;
+      const approved = remainingApprovals.find((a) => a.toolUseId === w.id)?.approved;
+      if (approved) {
+        const guardErr = guardIds(input);
+        if (guardErr) {
+          emitToolResult(emit, w.id, guardErr);
+          writeResults.push(toolResultBlock(w.id, guardErr, true));
+          continue;
+        }
+        const res = WRITE_EXECUTORS[w.name].execute(input);
+        emitToolResult(emit, w.id, res);
+        writeResults.push(toolResultBlock(w.id, res));
+      } else {
+        const declined = { declined: true, message: 'User declined this action.' };
+        emitToolResult(emit, w.id, declined);
+        writeResults.push(toolResultBlock(w.id, declined));
+      }
+    }
+
+    msgs.push({ role: 'user', content: [...readResults, ...writeResults] });
+    remainingApprovals = []; // consumed
+    emit({ type: EventType.STEP_FINISHED, stepName } as BaseEvent);
   }
 
   // Iteration cap - refined into a graceful, friendly finish in phase 4.
