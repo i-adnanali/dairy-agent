@@ -88,7 +88,17 @@ tool executors throwing).
 
 ## Section 1 - What actually got built
 
-_(Filled in as the phases land; see the phase list in the migration plan.)_
+### Surface map
+
+| Layer            | File / route                                   | Role                                                                 |
+| ---------------- | ---------------------------------------------- | ------------------------------------------------------------------- |
+| Server route     | `POST /api/agent/run` (`server/src/index.ts`)  | Sets SSE headers, builds an `EventEncoder`, reads `forwardedProps` (`messages`, `approvals`), calls `runAgentStream`. |
+| Server stream    | `server/src/agent/stream.ts`                   | Streaming counterpart of `runTurn`: emits AG-UI events via `anthropic.messages.stream()`, runs read/write tools, pauses on writes. |
+| Shared wire      | `shared/src/types.ts`                          | `AgentRunForwardedProps` + the `dairy.*` CUSTOM event name constants. |
+| Client transport | `web-angular/src/app/core/chat-store.ts`       | Drives `@ag-ui/client`'s `HttpAgent`, subscribes to `onEvent`, maps events to signals; `send()`/`resolve()` pass `forwardedProps`. |
+
+The read/write executors, digest shaper, system prompt, and DB layer are shared
+verbatim with the old loop — untouched by the migration.
 
 ### Custom event channels
 

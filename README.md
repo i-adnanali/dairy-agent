@@ -12,9 +12,8 @@ confirmation.
 ![Digest table returned by the agent](docs/images/digest_table.png)
 ![Milk-yield chart with hover interaction](docs/images/chart_hover_demo.gif)
 
-It is built as an npm-workspaces monorepo with **two interchangeable frontends**
-(React and Angular) that talk to the same, unmodified server over the identical
-`POST /api/chat` contract:
+It is built as an npm-workspaces monorepo with **two feature-equivalent
+frontends** (React and Angular) backed by one Express server:
 
 ```
 dairy-agent/
@@ -24,13 +23,32 @@ dairy-agent/
   web-angular/  # Angular 22 (standalone, zoneless) + Tailwind + ng2-charts frontend
 ```
 
-Both frontends are feature-equivalent; pick either. The Angular port and its
-architecture are documented in [docs/ANGULAR_PORT.md](docs/ANGULAR_PORT.md).
+### Two agent protocols, one agent
+
+The frontends use **different wire protocols** to the same underlying agent:
+
+| Frontend       | Endpoint             | Transport                                   |
+| -------------- | -------------------- | ------------------------------------------- |
+| `web-react/`   | `POST /api/chat`     | Blocking JSON: one request, one full reply. |
+| `web-angular/` | `POST /api/agent/run`| [AG-UI](https://docs.ag-ui.com) streaming events over SSE. |
+
+`/api/agent/run` streams the turn as AG-UI events (`RUN_STARTED`,
+`TEXT_MESSAGE_*`, `TOOL_CALL_*`, `RUN_FINISHED`, plus app-specific `CUSTOM`
+events for chart datasets, history, and pending writes), so the Angular UI shows
+text token-by-token and tool-call chips as they happen. Both protocols wrap the
+**same agent logic** (tools, read/write split, digest shaper, confirmation
+gating) — only *how results reach the client* differs, so the two apps behave
+identically. The Angular port is documented in
+[docs/ANGULAR_PORT.md](docs/ANGULAR_PORT.md); the AG-UI migration, its design
+decisions, and the per-frontend protocol split are in
+[docs/AGUI_MIGRATION.md](docs/AGUI_MIGRATION.md).
 
 ## Tech stack
 
 - **Server:** Node, TypeScript, Express, official Anthropic SDK
-  (`@anthropic-ai/sdk`), non-streaming.
+  (`@anthropic-ai/sdk`). Blocking JSON for `/api/chat`; AG-UI SSE streaming
+  (`@ag-ui/encoder` + `@ag-ui/core`) via `anthropic.messages.stream()` for
+  `/api/agent/run`.
 - **Database:** SQLite via `better-sqlite3` (synchronous, zero-config).
 - **Frontend (React):** React 18 + TypeScript + Vite, Tailwind CSS, Recharts.
 - **Frontend (Angular):** Angular 22 standalone + zoneless, signals, Tailwind CSS,
