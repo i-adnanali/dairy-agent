@@ -104,3 +104,56 @@ AG-UI message/state events:
 | `dairy.pending`  | `PendingWrite[]`           | Writes awaiting approval (Decision 2 interrupt payload).      |
 
 The lifecycle, text, and tool-call events are all native AG-UI events.
+
+### Where a Phase-0 decision changed in practice: the interrupt outcome
+
+Decision 2 planned to pause with `RUN_FINISHED { outcome: { type: "interrupt", ... } }`
+in addition to the `dairy.pending` CUSTOM event ("free protocol correctness").
+Live QA showed this actively breaks the client: `@ag-ui/client` records the
+interrupt outcome as an open interrupt on the thread and then **rejects the next
+run** unless its `RunAgentInput` carries a standard `resume[]` array addressing
+that interrupt id ("Thread has N pending interrupt(s) not addressed by resume").
+That conflicts with our stateless resume, which resends the opaque history plus
+approvals via `forwardedProps` rather than the client's `resume[]` machinery.
+
+**Resolution:** the write pause now ends with a **plain `RUN_FINISHED`** and
+signals the pending writes purely via the `dairy.pending` CUSTOM event. This
+keeps the client's interrupt state machine out of the loop, so the stateless
+`forwardedProps.approvals` resume works cleanly. The rest of Decision 2 (stateless
+new-run resume) stands.
+
+### Turn model (parity with the old loop)
+
+The streaming loop in `server/src/agent/stream.ts` mirrors `runTurn` in
+`server/src/agent/loop.ts` exactly: reads are (re)executed idempotently, writes
+pause for approval, and after an approved/declined write the loop continues so
+the model can summarise the result. That post-approval model turn is the same
+extra round-trip the old `/api/chat` did, so the assistant's wording after an
+approval is identical between the two frontends — the migration changes only the
+transport, never the agent semantics.
+
+On the client, each AG-UI run maps to at most one in-progress assistant turn:
+`TEXT_MESSAGE_CONTENT` appends live, `TOOL_CALL_*` build chips incrementally, and
+`dairy.dataset` appends charts. A resume run's `TOOL_CALL_RESULT` (which carries
+no preceding `TOOL_CALL_START` in that run) patches the existing chip by id.
+
+### Verified end to end (Phase 6)
+
+Against a live server + the Angular app: streamed text renders token-by-token; a
+`get_milk_yield` query streams tool chips and renders the Chart.js chart from
+`dairy.dataset`; `add_animal` / `log_milking` raise the confirmation card, and
+Approve resumes and persists to SQLite with no client error. The `web-react/`
+app and `POST /api/chat` were untouched throughout.
+
+## Section 2 - Fate of POST /api/chat
+
+`/api/chat` (the blocking, non-streaming JSON contract) is **retained** and
+unchanged. It still backs the `web-react/` frontend, which was intentionally not
+migrated. The two contracts now coexist:
+
+- `web-react/` → `POST /api/chat` (blocking `runTurn`).
+- `web-angular/` → `POST /api/agent/run` (streaming `runAgentStream`).
+
+This is deliberate: keeping `/api/chat` lets the React app serve as a live parity
+reference and avoids a big-bang cutover. If `web-react/` is ever retired,
+`/api/chat` and `server/src/agent/loop.ts` can be removed together.

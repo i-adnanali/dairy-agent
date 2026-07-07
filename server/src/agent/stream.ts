@@ -294,24 +294,25 @@ export async function runAgentStream({
       );
       emit({ type: EventType.STEP_FINISHED, stepName } as BaseEvent);
       // Persist history so the client can resend the assistant tool_use turn,
-      // then pause the run for approval (Decision 2). The pending cards travel
-      // over a CUSTOM event (the reliable app channel) and are mirrored in the
-      // RUN_FINISHED interrupt outcome for protocol correctness.
+      // then pause for approval (Decision 2). The pending cards travel over a
+      // CUSTOM dairy.pending event and the run ends with a plain RUN_FINISHED.
+      //
+      // NOTE: we deliberately do NOT use RUN_FINISHED { outcome: interrupt }.
+      // @ag-ui/client tracks that as an open interrupt and then rejects the
+      // next run unless it carries a standard resume[] addressing the interrupt
+      // id ("Thread has N pending interrupt(s) not addressed by resume"). That
+      // conflicts with our stateless forwardedProps.approvals resume. Signalling
+      // the pause via CUSTOM keeps the client's interrupt state machine out of
+      // the loop. (Phase-0 Decision 2 assumed the interrupt outcome was free
+      // belt-and-suspenders; in practice it fights the client - see
+      // docs/AGUI_MIGRATION.md.)
       emitHistory(emit, msgs);
       emit({ type: EventType.CUSTOM, name: DAIRY_PENDING_EVENT, value: cards } as BaseEvent);
       emit({
         type: EventType.RUN_FINISHED,
         threadId,
         runId,
-        outcome: {
-          type: 'interrupt',
-          interrupts: cards.map((c) => ({
-            id: c.toolUseId,
-            reason: 'tool_call',
-            toolCallId: c.toolUseId,
-            metadata: c as unknown as Record<string, unknown>,
-          })),
-        },
+        outcome: { type: 'success' },
       } as BaseEvent);
       return;
     }
