@@ -11,6 +11,8 @@
     "test": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
+    "@ag-ui/core": "^0.0.57",
+    "@ag-ui/encoder": "^0.0.57",
     "@anthropic-ai/sdk": "^0.32.1",
     "@dairy/shared": "*",
     "better-sqlite3": "^11.5.0",
