@@ -118,6 +118,26 @@ export type ChatRequest = {
 };
 
 // ---------------------------------------------------------------------------
+// AG-UI streaming contract (server <-> Angular client, POST /api/agent/run)
+//
+// The opaque Anthropic conversation history and the approval decisions travel
+// inside the AG-UI RunAgentInput's `forwardedProps` field, so the server keeps
+// history in its native block shape instead of mapping lossily onto AG-UI's
+// Message shape. The updated history, chart datasets, and pending writes travel
+// back to the client over CUSTOM events (see the names below).
+// ---------------------------------------------------------------------------
+
+export type AgentRunForwardedProps = {
+  messages: AnthropicMessage[]; // opaque history the client stores and resends
+  approvals?: Approval[]; // approval decisions on a resume run
+};
+
+/** CUSTOM event names used as app-specific side-channels over AG-UI. */
+export const DAIRY_DATASET_EVENT = 'dairy.dataset'; // value: Dataset
+export const DAIRY_MESSAGES_EVENT = 'dairy.messages'; // value: AnthropicMessage[]
+export const DAIRY_PENDING_EVENT = 'dairy.pending'; // value: PendingWrite[]
+
+// ---------------------------------------------------------------------------
 // Minimal Anthropic message shapes (kept opaque to the client, but typed
 // enough for the loop to assemble tool_use / tool_result blocks).
 // ---------------------------------------------------------------------------
