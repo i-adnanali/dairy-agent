@@ -17,8 +17,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build:shared
-      - run: npm run typecheck            # shared + server + web-react
+      - run: npm run typecheck            # shared + server
       - run: npm test -w server           # pure shaper tests, no DB/key
-      - run: npm run build -w web-react
       - run: npm test -w web-angular      # Vitest (jsdom); CI=true is auto-set
       - run: npm run build -w web-angular

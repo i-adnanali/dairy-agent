@@ -157,6 +157,10 @@ app and `POST /api/chat` were untouched throughout.
 
 ## Section 2 - Fate of POST /api/chat
 
+> **Superseded by Section 3.** At the time of the migration `/api/chat` was
+> retained; it has since been **archived**. The section below is kept as the
+> historical record of the original coexistence decision.
+
 `/api/chat` (the blocking, non-streaming JSON contract) is **retained** and
 unchanged. It still backs the `web-react/` frontend, which was intentionally not
 migrated. The two contracts now coexist:
@@ -167,3 +171,40 @@ migrated. The two contracts now coexist:
 This is deliberate: keeping `/api/chat` lets the React app serve as a live parity
 reference and avoids a big-bang cutover. If `web-react/` is ever retired,
 `/api/chat` and `server/src/agent/loop.ts` can be removed together.
+
+## Section 3 - React frontend and /api/chat archived
+
+**Decision (reversal of Section 2's "keep React as a live parity reference"
+call):** `web-react/`, the `POST /api/chat` route in `server/src/index.ts`, and
+`server/src/agent/loop.ts` are **archived, not maintained going forward**. `main`
+now carries exactly one agent transport: `POST /api/agent/run` (streaming
+`runAgentStream`).
+
+**Why the earlier decision changed.** Keeping React alive rested on two things:
+using it as a cross-check while requirements were still evolving, and a narrative
+parallel to a separate positioning discussion. Both weaken once requirements are
+settled and Angular is confirmed as the only actively developed target —
+maintaining a second frontend stops buying protection against an unknown future
+and just becomes upkeep against a target that no longer moves.
+
+**What's preserved instead of a running app.** The migration is already proven and
+permanently checkable via git history — the `angular-port/*` and `v0.2.0` tags,
+plus this document — so archiving the code doesn't erase the evidence; it just
+stops paying an ongoing maintenance cost for a comparison already made.
+
+**Verified before archiving (not assumed).** `server/src/agent/loop.ts` was a
+self-contained blocking wrapper: it imported from `../tools` and `./systemPrompt`
+(the same shared modules `stream.ts` uses), but nothing in the codebase imported
+`loop.ts` itself except the `/api/chat` route. Removing it, the React app, and the
+`/api/chat` route leaves `stream.ts`, `../tools`, and `systemPrompt.ts` — the
+AG-UI/Angular path — untouched.
+
+**Mechanics.** The pre-removal state was tagged `archive/react-frontend-final`
+before the code was deleted from `main`, so the git history (not a running app)
+remains the permanent proof.
+
+**Simplification this enables.** With only one transport left, `threadId` is the
+natural, already-existing session key — no need to derive a session key by hashing
+`messages[0]`. This directly feeds the Cycle 1 observability work, where the
+approval pause and its resume are linked into one Langfuse session via
+`sessionId = threadId`.

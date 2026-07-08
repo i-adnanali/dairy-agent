@@ -12,53 +12,55 @@ confirmation.
 ![Digest table returned by the agent](docs/images/digest_table.png)
 ![Milk-yield chart with hover interaction](docs/images/chart_hover_demo.gif)
 
-It is built as an npm-workspaces monorepo with **two feature-equivalent
-frontends** (React and Angular) backed by one Express server:
+It is built as an npm-workspaces monorepo with an **Angular frontend** backed by
+one Express server:
 
 ```
 dairy-agent/
   shared/       # TypeScript types shared by server + web (single source of truth)
   server/       # Express + Anthropic SDK orchestrator, SQLite, tools, agent loop
-  web-react/    # React 18 + Vite + Tailwind + Recharts frontend
   web-angular/  # Angular 22 (standalone, zoneless) + Tailwind + ng2-charts frontend
 ```
 
-### Two agent protocols, one agent
+> **Archived:** an earlier React frontend and its blocking `POST /api/chat`
+> route (plus `server/src/agent/loop.ts`) were removed once Angular became the
+> sole actively developed target. They remain permanently checkable via git
+> history at the `archive/react-frontend-final` and `v0.2.0` tags; the reasoning
+> is in [docs/AGUI_MIGRATION.md](docs/AGUI_MIGRATION.md).
 
-The frontends use **different wire protocols** to the same underlying agent:
+### The agent protocol
+
+The Angular frontend talks to the agent over a single streaming endpoint:
 
 | Frontend       | Endpoint             | Transport                                   |
 | -------------- | -------------------- | ------------------------------------------- |
-| `web-react/`   | `POST /api/chat`     | Blocking JSON: one request, one full reply. |
 | `web-angular/` | `POST /api/agent/run`| [AG-UI](https://docs.ag-ui.com) streaming events over SSE. |
 
 `/api/agent/run` streams the turn as AG-UI events (`RUN_STARTED`,
 `TEXT_MESSAGE_*`, `TOOL_CALL_*`, `RUN_FINISHED`, plus app-specific `CUSTOM`
 events for chart datasets, history, and pending writes), so the Angular UI shows
-text token-by-token and tool-call chips as they happen. Both protocols wrap the
-**same agent logic** (tools, read/write split, digest shaper, confirmation
-gating) — only *how results reach the client* differs, so the two apps behave
-identically. The Angular port is documented in
-[docs/ANGULAR_PORT.md](docs/ANGULAR_PORT.md); the AG-UI migration, its design
-decisions, and the per-frontend protocol split are in
-[docs/AGUI_MIGRATION.md](docs/AGUI_MIGRATION.md).
+text token-by-token and tool-call chips as they happen. Tracing lives one layer
+below the transport, in the shared agent logic (tools, read/write split, digest
+shaper, confirmation gating). The Angular port is documented in
+[docs/ANGULAR_PORT.md](docs/ANGULAR_PORT.md); the AG-UI migration and its design
+decisions are in [docs/AGUI_MIGRATION.md](docs/AGUI_MIGRATION.md).
 
 ## Tech stack
 
 - **Server:** Node, TypeScript, Express, official Anthropic SDK
-  (`@anthropic-ai/sdk`). Blocking JSON for `/api/chat`; AG-UI SSE streaming
-  (`@ag-ui/encoder` + `@ag-ui/core`) via `anthropic.messages.stream()` for
-  `/api/agent/run`.
+  (`@anthropic-ai/sdk`). AG-UI SSE streaming (`@ag-ui/encoder` + `@ag-ui/core`)
+  via `anthropic.messages.stream()` for `/api/agent/run`.
+- **Observability:** self-hosted [Langfuse](https://langfuse.com) via its
+  OTel-based JS SDK (`@langfuse/tracing`, `@langfuse/otel`,
+  `@opentelemetry/sdk-node`); see [Observability](#observability-langfuse).
 - **Database:** SQLite via `better-sqlite3` (synchronous, zero-config).
-- **Frontend (React):** React 18 + TypeScript + Vite, Tailwind CSS, Recharts.
 - **Frontend (Angular):** Angular 22 standalone + zoneless, signals, Tailwind CSS,
   `ng2-charts` (Chart.js), `marked` + `DOMPurify` for markdown.
 - **Model:** default `claude-sonnet-4-6` (override with `ANTHROPIC_MODEL`); falls
   back to the latest Sonnet if the configured model string is rejected.
 
-> **Node version:** the React frontend runs on Node ≥ 20, but the **Angular 22**
-> frontend requires Node `^22.22.3 || ^24.15.0 || >=26`. Use a satisfying version
-> (e.g. via `nvm`) when working on `web-angular/`.
+> **Node version:** the **Angular 22** frontend requires Node
+> `^22.22.3 || ^24.15.0 || >=26`. Use a satisfying version (e.g. via `nvm`).
 
 ## Setup & run
 
@@ -72,28 +74,61 @@ cp .env.example .env        # then edit .env and add ANTHROPIC_API_KEY
 # 3. create + seed the SQLite database (idempotent: drop + recreate)
 npm run seed -w server      # creates server/dairy.db
 
-# 4a. run server (:4000) + React web (:5173); Vite proxies /api -> :4000
-npm run dev
-
-# 4b. or run server (:4000) + Angular web (:4200); ng proxies /api -> :4000
+# 4. run server (:4000) + Angular web (:4200); ng proxies /api -> :4000
 npm run dev:angular
 ```
 
-Then open <http://localhost:5173> (React) or <http://localhost:4200> (Angular).
+Then open <http://localhost:4200> (Angular).
 
 `GET /api/health` returns `{ status: "ok", seeded: true, anthropicKey: <bool> }`
 once the DB is seeded. If you start the server before seeding, the health check
-and chat endpoint return a friendly "run `npm run seed` first" message instead
+and agent endpoint return a friendly "run `npm run seed` first" message instead
 of failing obscurely.
 
 ### Useful scripts
 
 - `npm run seed -w server` — recreate and seed `server/dairy.db` (fixed RNG, so
   the data — and the milk-yield trend — is reproducible).
-- `npm run typecheck` — typecheck shared + server + web-react.
+- `npm run typecheck` — typecheck shared + server.
 - `npm run build:angular` — build shared + the Angular frontend.
 - `npm test -w server` — sanity tests for the digest shaper.
 - `npm test -w web-angular` — Vitest unit tests for the Angular frontend.
+
+## Observability (Langfuse)
+
+Every agent turn is traced with a **self-hosted [Langfuse](https://langfuse.com)**
+instance, instrumented via its OTel-based JS SDK (`@langfuse/tracing`,
+`@langfuse/otel`, `@opentelemetry/sdk-node`). Tracing sits one layer below the
+AG-UI transport, in the shared tool-call/model-call logic, so it is decoupled
+from the wire protocol.
+
+```bash
+# 1. start the Langfuse stack (Postgres, ClickHouse, Redis, MinIO, web + worker)
+docker compose -f docker-compose.langfuse.yml up -d
+
+# 2. open the UI, create a project, copy its keys into .env
+open http://localhost:3000        # LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY
+
+# 3. run the app as usual; traces stream to Langfuse
+npm run dev:angular
+```
+
+What gets traced, per turn:
+
+- **One trace per run**, grouped into a **session keyed by `threadId`** — so an
+  approval **pause and its resume are two traces under one session**, not two
+  disconnected traces.
+- **A generation observation per model call**, with token counts pulled from the
+  Anthropic response `usage` so Langfuse infers cost with no hand-rolled pricing
+  table.
+- **A tool observation per read/write tool call**, recording the model digest
+  (never the raw dataset rows) as output.
+- **Custom trace attributes:** `digest_size` and `dataset_rows` (to correlate
+  response shape with latency/cost) and `finish_reason`
+  (`completed` / `iteration_cap` / `awaiting_approval`).
+
+If the `LANGFUSE_*` keys are unset, tracing is silently disabled and the agent
+runs normally.
 
 ## How this demonstrates assistant → agent
 
@@ -104,9 +139,9 @@ app. Here is exactly where each one lives in the code:
 
 The model's native tool-calling drives everything — there is no hand-written
 intent parsing. The loop in
-[`server/src/agent/loop.ts`](server/src/agent/loop.ts) sends the conversation +
-tool schemas to the model, runs whatever tools it calls, feeds results back, and
-repeats until the model stops calling tools and writes the final answer. Tool
+[`server/src/agent/stream.ts`](server/src/agent/stream.ts) sends the conversation
++ tool schemas to the model, runs whatever tools it calls, feeds results back,
+and repeats until the model stops calling tools and writes the final answer. Tool
 schemas live in [`server/src/tools/index.ts`](server/src/tools/index.ts) and the
 system prompt (with a live farm catalog injected) in
 [`server/src/agent/systemPrompt.ts`](server/src/agent/systemPrompt.ts).
@@ -116,8 +151,8 @@ system prompt (with a live farm catalog injected) in
 Read tools ([`server/src/tools/reads.ts`](server/src/tools/reads.ts)) execute
 automatically inside the loop. Write tools
 ([`server/src/tools/writes.ts`](server/src/tools/writes.ts)) never run on their
-own: when the model calls one, `runTurn` **pauses** and returns a
-`PendingWrite` confirmation card (`done: false`). Nothing is written until the
+own: when the model calls one, `runAgentStream` **pauses** and emits a
+`PendingWrite` confirmation card (via the `dairy.pending` CUSTOM event). Nothing is written until the
 user approves; the resume path executes only the approved writes and records a
 "declined" tool result for the rest. Re-sending the same approval does not
 double-write, because the server is stateless and only mutates on an explicit
@@ -130,8 +165,8 @@ approval decision in that request.
 series** (every bucket) is shipped to the client as a `Dataset` and rendered as
 a chart — it **never enters the model's context**. The model receives only a
 small **digest** (totals, mean, min/max, first/last, period-over-period %). You
-can watch this in the server logs: `[loop] read get_milk_yield -> model digest:`
-prints the stats, not the raw rows.
+can watch this in Langfuse: each read tool call is traced as its own observation,
+with the model digest (not the raw rows) recorded as its output.
 
 ### 4. Wrong cheaply, never expensively
 
@@ -145,7 +180,7 @@ prints the stats, not the raw rows.
   `day → week` past 90 days and `→ month` past a year before doing any work, so a
   huge range can't blow up the dataset or the digest.
 - **The loop is bounded.** `max_tokens` per call and a max-iteration cap (with a
-  graceful "narrow it down" message) live in `loop.ts`.
+  graceful "narrow it down" message) live in `stream.ts`.
 
 ## Scale design
 

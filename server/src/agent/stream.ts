@@ -18,6 +18,12 @@ import {
 } from '../tools';
 import { isToolError } from '../tools/reads';
 import { buildSystemPrompt } from './systemPrompt';
+import {
+  startActiveObservation,
+  startObservation,
+  updateActiveObservation,
+} from '@langfuse/tracing';
+import { setTraceMetadata, setTraceName, setTraceSession } from './tracing';
 
 const DEFAULT_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
 const FALLBACK_MODEL = 'claude-sonnet-4-5';
@@ -91,62 +97,105 @@ async function streamModelTurn(
   const assistantMsgId = `msg_${randomUUID()}`;
   const blocks = new Map<number, { kind: 'text' | 'tool'; toolCallId?: string }>();
 
-  const stream = getClient().messages.stream({
-    model,
-    max_tokens: MAX_TOKENS,
-    system,
-    tools: ALL_TOOLS as unknown as Anthropic.Tool[],
-    messages,
-  });
+  // One Langfuse generation per actual model call; a fallback attempt calls this
+  // again and so shows up as its own generation. Token counts come from the
+  // Anthropic response so Langfuse infers cost from the model with no pricing table.
+  const generation = startObservation(
+    'anthropic-messages',
+    { model, input: messages },
+    { asType: 'generation' },
+  );
 
-  for await (const ev of stream) {
-    if (ev.type === 'content_block_start') {
-      if (ev.content_block.type === 'text') {
-        blocks.set(ev.index, { kind: 'text' });
-        emit({
-          type: EventType.TEXT_MESSAGE_START,
-          messageId: assistantMsgId,
-          role: 'assistant',
-        } as BaseEvent);
-      } else if (ev.content_block.type === 'tool_use') {
-        blocks.set(ev.index, { kind: 'tool', toolCallId: ev.content_block.id });
-        emit({
-          type: EventType.TOOL_CALL_START,
-          toolCallId: ev.content_block.id,
-          toolCallName: ev.content_block.name,
-          parentMessageId: assistantMsgId,
-        } as BaseEvent);
-      }
-    } else if (ev.type === 'content_block_delta') {
-      const info = blocks.get(ev.index);
-      if (ev.delta.type === 'text_delta' && info?.kind === 'text' && ev.delta.text) {
-        emit({
-          type: EventType.TEXT_MESSAGE_CONTENT,
-          messageId: assistantMsgId,
-          delta: ev.delta.text,
-        } as BaseEvent);
-      } else if (
-        ev.delta.type === 'input_json_delta' &&
-        info?.kind === 'tool' &&
-        ev.delta.partial_json
-      ) {
-        emit({
-          type: EventType.TOOL_CALL_ARGS,
-          toolCallId: info.toolCallId,
-          delta: ev.delta.partial_json,
-        } as BaseEvent);
-      }
-    } else if (ev.type === 'content_block_stop') {
-      const info = blocks.get(ev.index);
-      if (info?.kind === 'text') {
-        emit({ type: EventType.TEXT_MESSAGE_END, messageId: assistantMsgId } as BaseEvent);
-      } else if (info?.kind === 'tool') {
-        emit({ type: EventType.TOOL_CALL_END, toolCallId: info.toolCallId } as BaseEvent);
+  try {
+    const stream = getClient().messages.stream({
+      model,
+      max_tokens: MAX_TOKENS,
+      system,
+      tools: ALL_TOOLS as unknown as Anthropic.Tool[],
+      messages,
+    });
+
+    for await (const ev of stream) {
+      if (ev.type === 'content_block_start') {
+        if (ev.content_block.type === 'text') {
+          blocks.set(ev.index, { kind: 'text' });
+          emit({
+            type: EventType.TEXT_MESSAGE_START,
+            messageId: assistantMsgId,
+            role: 'assistant',
+          } as BaseEvent);
+        } else if (ev.content_block.type === 'tool_use') {
+          blocks.set(ev.index, { kind: 'tool', toolCallId: ev.content_block.id });
+          emit({
+            type: EventType.TOOL_CALL_START,
+            toolCallId: ev.content_block.id,
+            toolCallName: ev.content_block.name,
+            parentMessageId: assistantMsgId,
+          } as BaseEvent);
+        }
+      } else if (ev.type === 'content_block_delta') {
+        const info = blocks.get(ev.index);
+        if (ev.delta.type === 'text_delta' && info?.kind === 'text' && ev.delta.text) {
+          emit({
+            type: EventType.TEXT_MESSAGE_CONTENT,
+            messageId: assistantMsgId,
+            delta: ev.delta.text,
+          } as BaseEvent);
+        } else if (
+          ev.delta.type === 'input_json_delta' &&
+          info?.kind === 'tool' &&
+          ev.delta.partial_json
+        ) {
+          emit({
+            type: EventType.TOOL_CALL_ARGS,
+            toolCallId: info.toolCallId,
+            delta: ev.delta.partial_json,
+          } as BaseEvent);
+        }
+      } else if (ev.type === 'content_block_stop') {
+        const info = blocks.get(ev.index);
+        if (info?.kind === 'text') {
+          emit({ type: EventType.TEXT_MESSAGE_END, messageId: assistantMsgId } as BaseEvent);
+        } else if (info?.kind === 'tool') {
+          emit({ type: EventType.TOOL_CALL_END, toolCallId: info.toolCallId } as BaseEvent);
+        }
       }
     }
-  }
 
-  return await stream.finalMessage();
+    const finalMessage = await stream.finalMessage();
+    const usage = finalMessage.usage as {
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_input_tokens?: number | null;
+      cache_creation_input_tokens?: number | null;
+    };
+    generation
+      .update({
+        model,
+        output: finalMessage.content,
+        usageDetails: {
+          input: usage.input_tokens,
+          output: usage.output_tokens,
+          ...(usage.cache_read_input_tokens != null
+            ? { cache_read_input_tokens: usage.cache_read_input_tokens }
+            : {}),
+          ...(usage.cache_creation_input_tokens != null
+            ? { cache_creation_input_tokens: usage.cache_creation_input_tokens }
+            : {}),
+        },
+        metadata: { stopReason: finalMessage.stop_reason ?? 'unknown' },
+      })
+      .end();
+    return finalMessage;
+  } catch (err: unknown) {
+    generation
+      .update({
+        level: 'ERROR',
+        statusMessage: err instanceof Error ? err.message : String(err),
+      })
+      .end();
+    throw err;
+  }
 }
 
 /** Call the model, falling back to the latest Sonnet if the configured model
@@ -192,22 +241,44 @@ function emitToolResult(emit: Emit, toolCallId: string, content: unknown): void 
  * already emitted in the prior run, so we re-execute silently for the model
  * only.
  */
-function runReads(
-  emit: Emit,
-  reads: ToolUse[],
-  emitUi: boolean,
-): Anthropic.ToolResultBlockParam[] {
+/** What runReads reports back to the loop: the tool_result blocks plus stats fed
+ * into the trace's custom `digest_size` / `dataset_rows` attributes. */
+interface ReadRunResult {
+  results: Anthropic.ToolResultBlockParam[];
+  digestBytes: number;
+  datasetRows: number;
+}
+
+function runReads(emit: Emit, reads: ToolUse[], emitUi: boolean): ReadRunResult {
   const results: Anthropic.ToolResultBlockParam[] = [];
+  let digestBytes = 0;
+  let datasetRows = 0;
+
   for (const r of reads) {
     const input = (r.input ?? {}) as Record<string, unknown>;
+    const tool = startObservation(r.name, { input }, { asType: 'tool' });
+
     const guardErr = guardIds(input);
     if (guardErr) {
       if (emitUi) emitToolResult(emit, r.id, guardErr);
       results.push(toolResultBlock(r.id, guardErr, true));
+      tool
+        .update({
+          output: guardErr,
+          level: 'WARNING',
+          metadata: { toolUseId: r.id, kind: 'read', guardRejected: true },
+        })
+        .end();
       continue;
     }
+
     const { modelDigest, dataset } = READ_EXECUTORS[r.name](input);
     const errored = isToolError(modelDigest);
+    const bytes = JSON.stringify(modelDigest ?? null).length;
+    const rows = dataset?.points.length ?? 0;
+    digestBytes += bytes;
+    datasetRows += rows;
+
     if (emitUi) {
       emitToolResult(emit, r.id, modelDigest);
       if (dataset) {
@@ -219,16 +290,65 @@ function runReads(
       }
     }
     results.push(toolResultBlock(r.id, modelDigest, errored));
+    tool
+      .update({
+        output: modelDigest,
+        ...(errored ? { level: 'WARNING' as const } : {}),
+        metadata: {
+          toolUseId: r.id,
+          kind: 'read',
+          isError: errored,
+          digestBytes: bytes,
+          datasetRows: rows,
+          replay: !emitUi,
+        },
+      })
+      .end();
   }
-  return results;
+
+  return { results, digestBytes, datasetRows };
+}
+
+type FinishReason = 'completed' | 'awaiting_approval' | 'iteration_cap';
+
+/** Best-effort plain-text of the most recent user message, for the trace input. */
+function latestUserText(messages: AnyMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== 'user') continue;
+    if (typeof m.content === 'string') return m.content;
+    const text = (m.content as ContentBlock[])
+      .filter((b): b is Anthropic.TextBlockParam => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    if (text) return text;
+  }
+  return '';
+}
+
+/** Concatenated assistant text blocks, for the trace output. */
+function assistantTextOf(content: ContentBlock[]): string {
+  return content
+    .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+    .map((b) => b.text)
+    .join('\n');
 }
 
 /**
  * Text + read tools + write approval, streamed as AG-UI events, looping up to
  * MAX_ITERATIONS. Writes pause the run with a RUN_FINISHED interrupt outcome
  * (Decision 2); the client resumes with a fresh run carrying approvals.
+ *
+ * Wrapped in a Langfuse root observation so the whole turn is one trace, grouped
+ * by session (threadId) so a pause and its resume share a session.
  */
-export async function runAgentStream({
+export async function runAgentStream(args: RunStreamArgs): Promise<void> {
+  await startActiveObservation('agent-run', () => runAgentStreamTraced(args), {
+    asType: 'agent',
+  });
+}
+
+async function runAgentStreamTraced({
   threadId,
   runId,
   messages,
@@ -238,6 +358,24 @@ export async function runAgentStream({
   const system = buildSystemPrompt(todayISO());
   const msgs: AnyMessage[] = [...messages];
   let remainingApprovals = [...(approvals ?? [])];
+
+  // Trace-level attributes. threadId is the Langfuse session key so a pause and
+  // its resume (a new run on the same threadId) land in one session. The custom
+  // digest/dataset totals are accumulated across iterations and written at the
+  // exit that is actually taken, alongside finish_reason.
+  setTraceSession(threadId);
+  setTraceName('agent-run');
+  updateActiveObservation({ input: latestUserText(msgs) });
+  let totalDigestBytes = 0;
+  let totalDatasetRows = 0;
+  const finalize = (finishReason: FinishReason, output?: unknown): void => {
+    setTraceMetadata({
+      finish_reason: finishReason,
+      digest_size: totalDigestBytes,
+      dataset_rows: totalDatasetRows,
+    });
+    if (output !== undefined) updateActiveObservation({ output });
+  };
 
   emit({ type: EventType.RUN_STARTED, threadId, runId } as BaseEvent);
 
@@ -261,6 +399,7 @@ export async function runAgentStream({
       if (finalMessage.stop_reason !== 'tool_use') {
         emit({ type: EventType.STEP_FINISHED, stepName } as BaseEvent);
         emitHistory(emit, msgs);
+        finalize('completed', assistantTextOf(finalMessage.content));
         emit({
           type: EventType.RUN_FINISHED,
           threadId,
@@ -275,7 +414,10 @@ export async function runAgentStream({
     const reads = toolUses.filter((t) => READ_TOOL_NAMES.has(t.name));
     const writes = toolUses.filter((t) => WRITE_TOOL_NAMES.has(t.name));
 
-    const readResults = runReads(emit, reads, !lastIsAssistantToolUse);
+    const readRun = runReads(emit, reads, !lastIsAssistantToolUse);
+    const readResults = readRun.results;
+    totalDigestBytes += readRun.digestBytes;
+    totalDatasetRows += readRun.datasetRows;
 
     if (writes.length === 0) {
       msgs.push({ role: 'user', content: readResults });
@@ -308,6 +450,7 @@ export async function runAgentStream({
       // docs/AGUI_MIGRATION.md.)
       emitHistory(emit, msgs);
       emit({ type: EventType.CUSTOM, name: DAIRY_PENDING_EVENT, value: cards } as BaseEvent);
+      finalize('awaiting_approval', { pendingWrites: cards.length });
       emit({
         type: EventType.RUN_FINISHED,
         threadId,
@@ -322,20 +465,40 @@ export async function runAgentStream({
     for (const w of writes) {
       const input = (w.input ?? {}) as Record<string, unknown>;
       const approved = remainingApprovals.find((a) => a.toolUseId === w.id)?.approved;
+      const tool = startObservation(w.name, { input }, { asType: 'tool' });
       if (approved) {
         const guardErr = guardIds(input);
         if (guardErr) {
           emitToolResult(emit, w.id, guardErr);
           writeResults.push(toolResultBlock(w.id, guardErr, true));
+          tool
+            .update({
+              output: guardErr,
+              level: 'WARNING',
+              metadata: { toolUseId: w.id, kind: 'write', approved: true, guardRejected: true },
+            })
+            .end();
           continue;
         }
         const res = WRITE_EXECUTORS[w.name].execute(input);
         emitToolResult(emit, w.id, res);
         writeResults.push(toolResultBlock(w.id, res));
+        tool
+          .update({
+            output: res,
+            metadata: { toolUseId: w.id, kind: 'write', approved: true },
+          })
+          .end();
       } else {
         const declined = { declined: true, message: 'User declined this action.' };
         emitToolResult(emit, w.id, declined);
         writeResults.push(toolResultBlock(w.id, declined));
+        tool
+          .update({
+            output: declined,
+            metadata: { toolUseId: w.id, kind: 'write', approved: false, declined: true },
+          })
+          .end();
       }
     }
 
@@ -357,6 +520,7 @@ export async function runAgentStream({
   emit({ type: EventType.TEXT_MESSAGE_END, messageId: capMsgId } as BaseEvent);
   msgs.push({ role: 'assistant', content: ITERATION_CAP_MESSAGE });
   emitHistory(emit, msgs);
+  finalize('iteration_cap', ITERATION_CAP_MESSAGE);
   emit({
     type: EventType.RUN_FINISHED,
     threadId,

@@ -1,1 +1,0 @@
-{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/components/chartcard.tsx","./src/components/chatpanel.tsx","./src/components/composer.tsx","./src/components/confirmationcard.tsx","./src/components/emptystate.tsx","./src/components/message.tsx","./src/components/messagelist.tsx","./src/components/toolcallchip.tsx"],"version":"5.9.3"}

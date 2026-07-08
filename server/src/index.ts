@@ -1,13 +1,16 @@
 import 'dotenv/config';
+// Must be imported before any agent logic so the tracer provider is registered
+// before the first span is created.
+import './instrumentation';
+import { shutdownTracing } from './instrumentation';
 import { randomUUID } from 'node:crypto';
 import { EventType } from '@ag-ui/core';
 import type { BaseEvent, RunAgentInput } from '@ag-ui/core';
 import { EventEncoder } from '@ag-ui/encoder';
 import cors from 'cors';
 import express from 'express';
-import type { AgentRunForwardedProps, ChatRequest } from '@dairy/shared';
+import type { AgentRunForwardedProps } from '@dairy/shared';
 import { isSeeded } from './db';
-import { runTurn } from './agent/loop';
 import { runAgentStream } from './agent/stream';
 
 const app = express();
@@ -27,34 +30,7 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', seeded: true, anthropicKey: hasKey });
 });
 
-app.post('/api/chat', async (req, res) => {
-  if (!isSeeded()) {
-    return res.status(503).json({ error: 'unseeded', message: SEED_HINT });
-  }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(503).json({
-      error: 'no_api_key',
-      message:
-        'ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add your key.',
-    });
-  }
-
-  const body = req.body as ChatRequest;
-  if (!body || !Array.isArray(body.messages)) {
-    return res.status(400).json({ error: 'bad_request', message: 'messages[] is required.' });
-  }
-
-  try {
-    const result = await runTurn(body.messages as never, body.approvals ?? []);
-    res.json(result);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Unknown error';
-    console.error('[chat] error:', err);
-    res.status(500).json({ error: 'agent_error', message });
-  }
-});
-
-// AG-UI streaming endpoint. Runs alongside /api/chat (which is untouched).
+// AG-UI streaming endpoint: the sole agent transport.
 app.post('/api/agent/run', async (req, res) => {
   const input = (req.body ?? {}) as Partial<RunAgentInput> & {
     forwardedProps?: AgentRunForwardedProps;
@@ -104,7 +80,22 @@ app.post('/api/agent/run', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`dairy-agent server listening on http://localhost:${PORT}`);
   if (!isSeeded()) console.warn(`[warn] ${SEED_HINT}`);
 });
+
+// Flush buffered Langfuse spans before exit so short-lived dev runs don't drop
+// the last traces on Ctrl-C / container stop.
+let shuttingDown = false;
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal} received, flushing traces...`);
+  server.close();
+  await shutdownTracing();
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
