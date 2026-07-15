@@ -94,6 +94,75 @@ of failing obscurely.
 - `npm test -w server` — sanity tests for the digest shaper.
 - `npm test -w web-angular` — Vitest unit tests for the Angular frontend.
 
+## Command reference
+
+A consolidated cheat sheet for starting and stopping everything — the frontend,
+the backend, and the self-hosted Langfuse Docker stack. See
+[Setup & run](#setup--run) for the first-time flow and
+[Observability](#observability-langfuse) for what the Langfuse stack is.
+
+> **Node version first.** The Angular frontend needs Node
+> `^22.22.3 || ^24.15.0 || >=26`. If you use `nvm`, the repo pins a version in
+> [`.nvmrc`](.nvmrc) — run `nvm use` (or `nvm install`) in the repo root before
+> the app commands below, or `ng serve` fails with a Node-version error.
+
+### Frontend + backend (app)
+
+```bash
+# start server (:4000) + Angular (:4200) together; ng proxies /api -> :4000
+npm run dev:angular
+# open the app
+open http://localhost:4200
+
+# backend only (no Angular)
+npm run dev -w server
+
+# stop: press Ctrl-C in the terminal running it.
+# stop a stray/backgrounded instance (frees ports 4000 + 4200):
+lsof -tiTCP:4000 -sTCP:LISTEN | xargs -r kill
+lsof -tiTCP:4200 -sTCP:LISTEN | xargs -r kill
+```
+
+### Status / health checks
+
+```bash
+curl http://localhost:4000/api/health            # -> {"status":"ok","seeded":true,"anthropicKey":true}
+docker compose -f docker-compose.langfuse.yml ps  # Langfuse container health
+open http://localhost:3000                         # Langfuse UI
+```
+
+### Langfuse Docker stack
+
+```bash
+# start (Postgres, ClickHouse, Redis, MinIO, langfuse-web, langfuse-worker)
+docker compose -f docker-compose.langfuse.yml up -d
+
+# first run pulls ~6 images (a few GB); watch until all are healthy:
+docker compose -f docker-compose.langfuse.yml ps
+
+# stop + remove containers, KEEP trace data (volumes persist)
+docker compose -f docker-compose.langfuse.yml down
+
+# stop + remove containers AND drop all trace data (deletes volumes)
+docker compose -f docker-compose.langfuse.yml down -v
+```
+
+> After creating a project in the Langfuse UI, copy its public + secret keys into
+> `.env` (`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`; `LANGFUSE_BASE_URL`
+> defaults to `http://localhost:3000`) and restart the server. On startup it
+> prints `[tracing] Langfuse enabled -> http://localhost:3000`. With the keys
+> unset, tracing is silently disabled and the agent runs normally.
+
+### Teardown / reset
+
+```bash
+docker compose -f docker-compose.langfuse.yml down -v   # tear down Langfuse + trace data
+npm run seed -w server                                   # reset server/dairy.db to seeded state
+```
+
+> Re-seed if you approved any write actions during a session — approved writes
+> mutate `server/dairy.db`, and seeding restores the reproducible baseline.
+
 ## Observability (Langfuse)
 
 Every agent turn is traced with a **self-hosted [Langfuse](https://langfuse.com)**
