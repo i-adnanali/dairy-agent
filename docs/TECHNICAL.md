@@ -8,54 +8,63 @@ All line references are to the current source; the authoritative definitions liv
 
 ## Section 1 - The agent loop (internals)
 
-Entry point: `runTurn` in [server/src/agent/loop.ts](../server/src/agent/loop.ts), called once per `POST /api/chat` from [server/src/index.ts](../server/src/index.ts).
+Entry point: `runAgentStream` in [server/src/agent/stream.ts](../server/src/agent/stream.ts), called once per AG-UI run (`POST /api/agent/run`) from [server/src/index.ts](../server/src/index.ts).
 
 ```ts
-export async function runTurn(
-  inputMessages: Anthropic.MessageParam[],
-  approvals: Approval[] = [],
-): Promise<ChatResponse>
+export async function runAgentStream(args: RunStreamArgs): Promise<void>
+
+interface RunStreamArgs {
+  threadId: string;
+  runId: string;
+  messages: Anthropic.MessageParam[];
+  approvals?: Approval[];
+  emit: (event: BaseEvent) => void; // sink wired to the SSE response
+}
 ```
 
-The server is **stateless**: `inputMessages` is the entire conversation (sent by the client every turn) and `approvals` is the set of write decisions for this turn. Everything the loop accumulates - `datasets`, `toolCalls`, appended `messages` - is returned in the `ChatResponse` and then owned by the client.
+The server is **stateless**: `messages` is the entire conversation (sent by the client every turn inside the run input's `forwardedProps`) and `approvals` is the set of write decisions for this turn. The loop does not *return* a response object; it **streams** AG-UI events through `emit` (text, tool calls, and the `dairy.*` CUSTOM side-channels), and the client reassembles the turn from that event stream. The updated opaque history is streamed back over a `dairy.messages` CUSTOM event and then owned by the client.
+
+`runAgentStream` wraps the whole turn in a Langfuse root observation (`startActiveObservation('agent-run', ...)`), so one turn is one trace; see [OBSERVABILITY.md](./OBSERVABILITY.md).
 
 ### 1.1 Constants
 
-Defined at the top of [server/src/agent/loop.ts](../server/src/agent/loop.ts):
+Defined at the top of [server/src/agent/stream.ts](../server/src/agent/stream.ts):
 
 - `DEFAULT_MODEL` = `process.env.ANTHROPIC_MODEL` or `"claude-sonnet-4-6"`.
 - `FALLBACK_MODEL` = `"claude-sonnet-4-5"`.
 - `MAX_TOKENS` = `1500` (per model call).
-- `MAX_ITERATIONS` = `8` (upper bound on model/tool rounds in a single turn).
+- `MAX_ITERATIONS` = `process.env.AGENT_MAX_ITERATIONS` or `8` (upper bound on model/tool rounds in a single turn; the env override exists only to make the cap path testable).
 
 ### 1.2 Per-iteration algorithm
 
 The body is a bounded `for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++)` loop. Each iteration:
 
 1. **Resume check.** If the last message is an assistant message that already contains `tool_use` blocks (`lastIsAssistantToolUse`), the loop is *resuming* after a confirmation pause: it reuses those tool calls and does **not** call the model again.
-2. **Otherwise call the model.** `createMessage(system, messages)` is invoked; the assistant reply is pushed onto `messages`. If `resp.stop_reason !== 'tool_use'`, the model has produced its final answer -> return `{ done: true }` with the assistant text.
+2. **Otherwise stream the model.** `streamWithFallback(system, messages, emit)` opens `anthropic.messages.stream()` and translates its deltas into AG-UI `TEXT_MESSAGE_*` / `TOOL_CALL_*` events; the assembled assistant reply is pushed onto `messages`. If `stop_reason !== 'tool_use'`, the model has produced its final answer -> emit `RUN_FINISHED` (the text was already streamed) and return.
 3. **Split tool calls.** `tool_use` blocks are partitioned into `reads` (`READ_TOOL_NAMES`) and `writes` (`WRITE_TOOL_NAMES`).
-4. **Run reads** (always; they are idempotent). Each read is guarded (`guardIds`), executed, logged, and turned into a `tool_result` block; any produced `dataset` is collected for the client.
+4. **Run reads** (always; they are idempotent). Each read is guarded (`guardIds`), executed, and emitted as a `TOOL_CALL_RESULT` carrying the digest; any produced `dataset` is streamed to the client over a `dairy.dataset` CUSTOM event. On a resume run the read UI events are suppressed (already emitted in the run that proposed the write) and the read re-executes silently for the model only.
 5. **If no writes:** append the read results as a `user` message and continue to the next iteration so the model can digest and answer.
 6. **If writes exist:** enforce the human-in-the-loop gate (Section 1.3).
 
 ### 1.3 The write gate: pause and resume
 
-- **Unresolved writes** (a write `tool_use` with no matching `approvals` entry) cause the loop to build `PendingWrite` cards and **return early** with `done: false`. Nothing is executed. The client renders the cards.
+- **Unresolved writes** (a write `tool_use` with no matching `approvals` entry) cause the loop to build `PendingWrite` cards, emit them over a `dairy.pending` CUSTOM event, and **end the run** with a plain `RUN_FINISHED` (deliberately *not* an AG-UI `outcome: interrupt` — see Section 2.6 and [AGUI_MIGRATION.md](./AGUI_MIGRATION.md)). Nothing is executed. The client renders the cards.
 - **Resolved writes** (every write has a decision) are applied: for each `approved` write, `guardIds` runs again and then `WRITE_EXECUTORS[name].execute(input)`; each rejected write records a `{ declined: true }` tool result instead. Read + write results are appended and `remainingApprovals` is cleared (consumed once), so a resend cannot re-apply them.
 
 ### 1.4 Message assembly helpers
 
-- `createMessage(system, messages)` - sends `{ model, max_tokens, system, tools, messages }`; on HTTP `404`/`400` (likely an unknown model string) it retries **once** with `FALLBACK_MODEL`.
+- `streamModelTurn(model, system, messages, emit)` - opens `anthropic.messages.stream()` with `{ model, max_tokens, system, tools, messages }`, translates its deltas into AG-UI `TEXT_MESSAGE_*` / `TOOL_CALL_*` events, and records a Langfuse **generation** (token counts from the response `usage`). Returns the assembled `finalMessage`.
+- `streamWithFallback(system, messages, emit)` - wraps `streamModelTurn`: on HTTP `404`/`400` (likely an unknown model string) **and only if nothing has been emitted yet**, it retries **once** with `FALLBACK_MODEL`, so a mid-stream failure never double-emits.
 - `toolResultBlock(id, content, isError)` - wraps a result as `{ type: 'tool_result', tool_use_id, content: JSON.stringify(content), is_error }`.
-- `assistantText(msg)` - concatenates the `text` blocks of a model reply.
-- `argSummary(name, input)` - compact human string for the `ToolCallView` chips (arrays become `k=[n]`, objects `k={...}`).
+- `assistantTextOf(content)` - concatenates the `text` blocks of a model reply (used for the trace output).
+- `argSummary(name, input)` - compact human string for the `ToolCallView` chips (arrays become `k=[n]`, objects `k={…}`). In the streaming design this lives **client-side** in [web-angular/src/app/core/chat-store.ts](../web-angular/src/app/core/chat-store.ts), which reassembles chips from streamed `TOOL_CALL_ARGS`; the formatting is mirrored so chips read identically.
 
 ### 1.5 Exit conditions
 
-- **Normal:** model stops calling tools (`stop_reason !== 'tool_use'`) -> `done: true`.
-- **Pause:** unresolved writes -> `done: false` with `render.pendingWrites`.
-- **Cap:** the `for` loop exhausts `MAX_ITERATIONS` -> returns a graceful "This request got too involved... narrow it down" message with `done: true`.
+- **Normal:** model stops calling tools (`stop_reason !== 'tool_use'`) -> `RUN_FINISHED` (trace `finish_reason: completed`).
+- **Pause:** unresolved writes -> `dairy.pending` CUSTOM event + `RUN_FINISHED` (trace `finish_reason: awaiting_approval`).
+- **Cap:** the `for` loop exhausts `MAX_ITERATIONS` -> streams a graceful "This request got too involved... narrow it down" message, then `RUN_FINISHED` (trace `finish_reason: iteration_cap`). This is a normal completion, not a failure.
+- **Error:** a genuine failure (Anthropic API error, a tool executor throwing) surfaces as `RUN_ERROR`, not `RUN_FINISHED`.
 
 ### Diagram A - handling one tool call inside an iteration
 
@@ -72,7 +81,7 @@ flowchart TD
     DS -- "no" --> Skip["(no dataset)"]
 
     Kind -- "write" --> Dec{"approval decision present?"}
-    Dec -- "no" --> Card["build PendingWrite card -> PAUSE (done:false)"]
+    Dec -- "no" --> Card["build PendingWrite card -> emit dairy.pending -> PAUSE (RUN_FINISHED)"]
     Dec -- "approved" --> GW["guardIds(input)"]
     GW -- "error" --> WErr["tool_result: ToolError"]
     GW -- "ok" --> WExec["WRITE_EXECUTORS[name].execute(input)"]
@@ -117,15 +126,15 @@ When it fires, the digest carries `coarsened: true` and a `coarsenNote` so the m
 
 ### 2.4 Bounded loop and capped output
 
-`MAX_ITERATIONS = 8` and `MAX_TOKENS = 1500` in [server/src/agent/loop.ts](../server/src/agent/loop.ts). Hitting the iteration cap returns the "narrow it down" message rather than looping forever.
+`MAX_ITERATIONS = 8` (env-overridable) and `MAX_TOKENS = 1500` in [server/src/agent/stream.ts](../server/src/agent/stream.ts). Hitting the iteration cap streams the "narrow it down" message rather than looping forever.
 
 ### 2.5 Model fallback
 
-`createMessage` retries once with `FALLBACK_MODEL` if the configured model string is rejected (HTTP `400`/`404`), so a bad `ANTHROPIC_MODEL` degrades gracefully instead of failing the request.
+`streamWithFallback` retries once with `FALLBACK_MODEL` if the configured model string is rejected (HTTP `400`/`404`) before anything has streamed, so a bad `ANTHROPIC_MODEL` degrades gracefully instead of failing the request.
 
 ### 2.6 Read/write split and the human gate
 
-Reads execute automatically; writes never do. A write `tool_use` pauses the loop (`done: false`) and surfaces a `PendingWrite` card; nothing is written until the client returns an `Approval` with `approved: true`.
+Reads execute automatically; writes never do. A write `tool_use` pauses the loop — the run ends with a `dairy.pending` CUSTOM event (carrying the `PendingWrite` cards) plus a plain `RUN_FINISHED`; nothing is written until the client opens a resume run whose `forwardedProps.approvals` carries an `Approval` with `approved: true`. The pause is signalled via `dairy.pending` rather than an AG-UI `RUN_FINISHED { outcome: interrupt }`, because the interrupt outcome makes `@ag-ui/client` reject the next run unless it carries a standard `resume[]` array — which fights this app's stateless `forwardedProps.approvals` resume (see [AGUI_MIGRATION.md](./AGUI_MIGRATION.md)).
 
 ### 2.7 Stateless approvals / no double-write
 
@@ -142,12 +151,12 @@ flowchart LR
     Exec["Tool executor"] --> Digest["modelDigest"]
     Exec --> Dataset["dataset (optional)"]
     Digest --> Model["Model context (tool_result)"]
-    Dataset --> Client["ChatResponse.datasets -> charts (never to model)"]
+    Dataset --> Client["CUSTOM dairy.dataset -> charts (never to model)"]
 
     Digest -.->|"digest is a ToolError"| Retry["Model reads error and retries"]
 
-    Write["Write tool_use"] --> Pending["PendingWrite card"]
-    Pending --> UI["Client approval UI (done:false)"]
+    Write["Write tool_use"] --> Pending["PendingWrite card (CUSTOM dairy.pending)"]
+    Pending --> UI["Client approval UI (run ends with RUN_FINISHED)"]
 ```
 
 ---
@@ -174,15 +183,20 @@ type PendingWrite = {
 
 type ToolCallView = { toolUseId: string; name: string; status: 'done' | 'error'; argSummary: string };
 
-type ChatResponse = {
-  messages: AnthropicMessage[]; // client stores + resends next turn
-  render: { assistantText: string; toolCalls: ToolCallView[]; pendingWrites?: PendingWrite[] };
-  datasets: Dataset[];          // rendered as charts; never sent to the model
-  done: boolean;                // false => awaiting approval (or iteration cap)
+// AG-UI wire contract (POST /api/agent/run). History + approvals travel UP inside
+// the run input's forwardedProps; datasets, updated history, and pending writes
+// travel DOWN over CUSTOM events named by these constants.
+type AgentRunForwardedProps = {
+  messages: AnthropicMessage[];  // opaque history the client stores and resends
+  approvals?: Approval[];        // approval decisions on a resume run
 };
+
+const DAIRY_DATASET_EVENT = 'dairy.dataset';   // value: Dataset      (chart only)
+const DAIRY_MESSAGES_EVENT = 'dairy.messages'; // value: AnthropicMessage[]
+const DAIRY_PENDING_EVENT = 'dairy.pending';   // value: PendingWrite[]
 ```
 
-A read executor returns a **`modelDigest`** (small, enters the model context) and optionally a **`dataset`** (full, goes to the client only). A write executor exposes `buildCard()` (the `PendingWrite`) and `execute()` (the mutation).
+A read executor returns a **`modelDigest`** (small, enters the model context) and optionally a **`dataset`** (full, streamed to the client over `dairy.dataset` only). A write executor exposes `buildCard()` (the `PendingWrite`) and `execute()` (the mutation).
 
 ### 3.2 Read tools
 
@@ -225,7 +239,7 @@ The single most important contract for "display data is not reasoning data" ([se
 // DatasetPoint = { periodStart, totalLitres, avgPerAnimal }
 ```
 
-The `points` array (every bucket) is the full time series. It is attached to `ChatResponse.datasets` and rendered by `ChartCard`; it **never enters the model's context**. The model only ever sees the digest stats.
+The `points` array (every bucket) is the full time series. It is streamed to the client over a `dairy.dataset` CUSTOM event and rendered by `ChartCard`; it **never enters the model's context**. The model only ever sees the digest stats.
 
 ### 3.4 Write tools
 
@@ -245,16 +259,17 @@ Card label helper: `tagLabel(animalId)` renders `TAG (name)` when a name exists,
 
 | Setting | Value | Location |
 |---|---|---|
-| Default model | `ANTHROPIC_MODEL` env or `claude-sonnet-4-6` | [server/src/agent/loop.ts](../server/src/agent/loop.ts) |
-| Fallback model | `claude-sonnet-4-5` (on HTTP 400/404) | [server/src/agent/loop.ts](../server/src/agent/loop.ts) |
-| Max tokens / call | `1500` | [server/src/agent/loop.ts](../server/src/agent/loop.ts) |
-| Max iterations / turn | `8` | [server/src/agent/loop.ts](../server/src/agent/loop.ts) |
+| Default model | `ANTHROPIC_MODEL` env or `claude-sonnet-4-6` | [server/src/agent/stream.ts](../server/src/agent/stream.ts) |
+| Fallback model | `claude-sonnet-4-5` (on HTTP 400/404) | [server/src/agent/stream.ts](../server/src/agent/stream.ts) |
+| Max tokens / call | `1500` | [server/src/agent/stream.ts](../server/src/agent/stream.ts) |
+| Max iterations / turn | `AGENT_MAX_ITERATIONS` env or `8` | [server/src/agent/stream.ts](../server/src/agent/stream.ts) |
 | Coarsen day->week | range > 90 days | [server/src/tools/shaper.ts](../server/src/tools/shaper.ts) |
 | Coarsen ->month | range > 365 days | [server/src/tools/shaper.ts](../server/src/tools/shaper.ts) |
 | Inline catalog threshold | `300` animals | [server/src/agent/systemPrompt.ts](../server/src/agent/systemPrompt.ts) |
 | `search_animals` top-K | `8` | [server/src/tools/reads.ts](../server/src/tools/reads.ts) |
 | Server port | `PORT` env or `4000` | [server/src/index.ts](../server/src/index.ts) |
-| Web dev port | `5173` (Vite, proxies `/api` -> 4000) | web config |
-| Env vars | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `PORT` | `.env` (loaded from `server/.env`) |
+| Web dev port | `4200` (Angular `ng serve`, proxies `/api` -> 4000) | [web-angular/proxy.conf.json](../web-angular/proxy.conf.json) |
+| Tracing | opt-in Langfuse (no-op if keys unset) | [server/src/instrumentation.ts](../server/src/instrumentation.ts) |
+| Env vars | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `PORT`, `AGENT_MAX_ITERATIONS`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | `.env` (loaded from `server/.env` by `dotenv/config`) |
 
 See [PROJECT_OVERVIEW.md](./PROJECT_OVERVIEW.md) for the request lifecycle, architecture, and data-model diagrams.

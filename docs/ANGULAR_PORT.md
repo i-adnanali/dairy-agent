@@ -1,9 +1,19 @@
 # Dairy Farm Agent - Angular Frontend (Port Internals)
 
-A low-level reference for the **Angular 22** frontend (`web-angular/`), a feature-parity
-port of the React frontend (`web-react/`). Both talk to the **same, unmodified** `server/`
-over the identical `POST /api/chat` wire contract. For the backend agent loop, guardrails,
-and tool contracts, see [TECHNICAL.md](./TECHNICAL.md); this document does not repeat them.
+A low-level reference for the **Angular 22** frontend (`web-angular/`), originally a
+feature-parity port of the now-archived React frontend (`web-react/`). For the backend
+agent loop, guardrails, and tool contracts, see [TECHNICAL.md](./TECHNICAL.md); this
+document does not repeat them.
+
+> **Transport note.** This doc's React → Angular *state-model* mapping (signals, standalone,
+> zoneless, `OnPush`, `marked`/`DOMPurify`, `ng2-charts`) is current. What has since changed
+> is the **transport**: the port initially spoke the same blocking `POST /api/chat` JSON
+> contract as React, but the Angular app was subsequently migrated to **AG-UI streaming
+> events over SSE** (`POST /api/agent/run`) — and the React app and `/api/chat` were archived.
+> The store therefore no longer does a single `fetch` + `applyResponse`; it drives an
+> `@ag-ui/client` `HttpAgent` and maps a stream of AG-UI events onto its signals. Sections
+> 1 and 4 below reflect that current, AG-UI-based store. The transport migration itself is
+> documented in [AGUI_MIGRATION.md](./AGUI_MIGRATION.md).
 
 The port was done in tagged phases (`angular-port/00-scaffold` .. `angular-port/05-parity-qa`).
 This document describes the resulting architecture, not the migration steps.
@@ -13,9 +23,11 @@ This document describes the resulting architecture, not the migration steps.
 ## Section 1 - State service (the core)
 
 All UI renders off a single injectable, [web-angular/src/app/core/chat-store.ts](../web-angular/src/app/core/chat-store.ts).
-It is a direct port of the state model in `web-react/src/App.tsx`: five state atoms, two
-derived values, and the three imperative flows (`send`, `resolve`, `applyResponse`) around
-one `fetch` call.
+Its state model is a direct port of `web-react/src/App.tsx`: five state atoms and two
+derived values. The two imperative flows (`send`, `resolve`) each open an **AG-UI run** via
+an `@ag-ui/client` `HttpAgent` and feed the resulting event stream into the signals through a
+single `handleEvent` mapper (which replaces the old REST store's `applyResponse` +
+`postChat`).
 
 ### 1.1 React -> Angular mapping
 
@@ -28,21 +40,25 @@ one `fetch` call.
 | `useState<string \| null>` `error` | `signal<string \| null>` `error` |
 | `const busy = loading \|\| pending !== null` | `computed(() => loading() \|\| pending() !== null)` |
 | `useMemo(() => renderLog.length === 0)` `isEmpty` | `computed(() => renderLog().length === 0)` |
-| `useCallback` `send` / `resolve` / `applyResponse` | plain `async` methods |
+| `useCallback` `send` / `resolve` | plain `async` methods driving `HttpAgent.runAgent` |
+| (REST `applyResponse`) | `handleEvent` — maps AG-UI events onto the signals |
 | module-level `idSeq` + `nextId()` | instance `seq` + `nextId()` |
 
-The behavior is preserved exactly:
+The behavior:
 
 - **`send(text)`** - no-ops if `busy()`; clears error; optimistically appends the user
-  message to both `messages` and `renderLog`; posts the full `messages` array; applies the
-  response.
-- **`resolve(approvals)`** - clears `pending`; resends the **unchanged** `messages` plus the
-  `approvals` array (client-authoritative full-history resend).
-- **`applyResponse(resp)`** - replaces `messages` with the server's opaque history, appends an
-  assistant `TurnItem` only when there is content (`assistantText || toolCalls.length ||
-  datasets.length`), and sets `pending` from `render.pendingWrites ?? null`.
-- **`postChat`** - `fetch('/api/chat', POST)`; on `!res.ok` it reads `body.message` for the
-  error banner, exactly as the React `api.ts` did.
+  message to both `messages` and `renderLog`; then opens an AG-UI run via `runAgent(next)`.
+- **`resolve(approvals)`** - clears `pending`; opens a fresh AG-UI run that resends the
+  **unchanged** `messages` plus the `approvals` array (client-authoritative full-history
+  resend), both inside the run input's `forwardedProps`.
+- **`runAgent(messages, approvals?)`** - sets `loading`, clears the per-run streaming buffers,
+  and calls `HttpAgent.runAgent({ forwardedProps }, { onEvent })`, routing every event to
+  `handleEvent`.
+- **`handleEvent(event)`** - the AG-UI event mapper (replaces the REST `applyResponse`):
+  `TEXT_MESSAGE_CONTENT` appends tokens to the in-progress assistant `TurnItem`;
+  `TOOL_CALL_*` build/patch chips; the `dairy.dataset` / `dairy.messages` / `dairy.pending`
+  CUSTOM events append charts, replace the opaque history, and set `pending`; `RUN_ERROR`
+  sets the error banner.
 
 `TurnItem` is ported verbatim in
 [web-angular/src/app/core/turn-item.type.ts](../web-angular/src/app/core/turn-item.type.ts).
@@ -54,11 +70,11 @@ flowchart TD
     Send["send(text)"] --> Busy{"busy()?"}
     Busy -- "yes" --> Noop["return (no-op)"]
     Busy -- "no" --> Optim["append user msg to messages + renderLog; loading=true"]
-    Optim --> Post["postChat(messages)"]
-    Post -- "ok" --> Apply["applyResponse: replace messages, maybe append assistant, set pending"]
-    Post -- "!ok" --> Err["error.set(body.message)"]
-    Apply --> Done["loading=false"]
-    Err --> Done
+    Optim --> Run["runAgent(messages): HttpAgent.runAgent(forwardedProps, {onEvent})"]
+    Run --> Stream["AG-UI events stream in"]
+    Stream --> Handle["handleEvent(): text deltas, tool chips, dairy.* CUSTOM, RUN_ERROR"]
+    Handle --> Signals["signal updates -> OnPush re-render"]
+    Signals --> Done["run ends (RUN_FINISHED/RUN_ERROR) -> loading=false"]
 ```
 
 ---
@@ -155,13 +171,15 @@ shared tooltip (`interaction: { mode: 'index' }`). Registered via
 | Node.js | `^22.22.3 \|\| ^24.15.0 \|\| >=26` (Angular 22 requirement) | - |
 | Angular | 22 (standalone, zoneless) | [web-angular/package.json](../web-angular/package.json) |
 | Dev server port | `4200` (proxies `/api` -> `:4000`) | [web-angular/proxy.conf.json](../web-angular/proxy.conf.json) |
-| Run server + Angular | `npm run dev:angular` | root [package.json](../package.json) |
-| Run server + React | `npm run dev` | root [package.json](../package.json) |
+| Run server + Angular | `npm run dev:angular` (and `npm run dev`, now an alias) | root [package.json](../package.json) |
 | Build Angular | `npm run build:angular` (builds shared first) | root [package.json](../package.json) |
 | Unit tests | `npm test -w web-angular` (Vitest) | - |
+| Agent transport | `@ag-ui/client` `HttpAgent` -> `POST /api/agent/run` (SSE) | [web-angular/package.json](../web-angular/package.json) |
 | Charts | `ng2-charts` + `chart.js` + `@angular/cdk` | [web-angular/package.json](../web-angular/package.json) |
 | Markdown | `marked` + `dompurify` | [web-angular/package.json](../web-angular/package.json) |
 | Shared types | `@dairy/shared` (built to `dist/` first) | [shared/](../shared) |
 
-The wire contract, agent loop, and all guardrails are unchanged - see
-[TECHNICAL.md](./TECHNICAL.md).
+The agent loop and all guardrails are unchanged - see [TECHNICAL.md](./TECHNICAL.md). The
+wire contract is now AG-UI streaming over SSE (`POST /api/agent/run`) rather than the
+original blocking `POST /api/chat`; that migration is documented in
+[AGUI_MIGRATION.md](./AGUI_MIGRATION.md).
