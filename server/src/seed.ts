@@ -85,12 +85,23 @@ function seed(): void {
     `INSERT INTO health_events (id, animal_id, date, type, notes, next_due_date)
      VALUES (@id, @animal_id, @date, @type, @notes, @next_due_date)`,
   );
+  const insertVendor = db.prepare(
+    `INSERT INTO vendors (id, name, contact, price_per_litre, status)
+     VALUES (@id, @name, @contact, @price_per_litre, @status)`,
+  );
+  const insertDelivery = db.prepare(
+    `INSERT INTO deliveries (id, vendor_id, date, litres, price_per_litre, paid)
+     VALUES (@id, @vendor_id, @date, @litres, @price_per_litre, @paid)`,
+  );
 
   const run = db.transaction(() => {
     for (const a of ANIMALS) insertAnimal.run(a);
 
     // 90 days of milkings (morning + evening) for each lactating animal.
+    // Accumulate total litres produced per date so vendor deliveries below can
+    // be derived from real production (with one deliberately-mismatched window).
     const DAYS = 90;
+    const dailyProduction = new Map<string, number>();
     let milkSeq = 0;
     for (const a of ANIMALS) {
       if (a.status !== 'lactating') continue;
@@ -102,14 +113,16 @@ function seed(): void {
         for (const session of ['morning', 'evening'] as const) {
           const noise = rand(-0.6, 0.6);
           const yieldL = Math.max(0, base * trend + noise);
+          const rounded = Math.round(yieldL * 100) / 100;
           milkSeq += 1;
           insertMilking.run({
             id: `milking_${String(milkSeq).padStart(5, '0')}`,
             animal_id: a.id,
             date,
             session,
-            yield_litres: Math.round(yieldL * 100) / 100,
+            yield_litres: rounded,
           });
+          dailyProduction.set(date, (dailyProduction.get(date) ?? 0) + rounded);
         }
       }
     }
@@ -133,6 +146,60 @@ function seed(): void {
       { id: 'health_006', animal_id: 'animal_002', date: daysAgo(8), type: 'vet_visit' as HealthEventType, notes: 'Routine hoof trimming.', next_due_date: null },
     ];
     for (const h of health) insertHealth.run(h);
+
+    // --- Vendors & deliveries (Cycle 2) --------------------------------------
+    // 4 vendors, one inactive (no deliveries) to exercise the active/inactive
+    // split. Deliveries are derived from real daily production so reconciliation
+    // is meaningful: most days the farm delivers 95-99% of what it produced
+    // (the 1-5% gap is home consumption / spoilage, within tolerance), EXCEPT a
+    // deliberately-mismatched 10-day window (21-30 days ago) where only ~65% was
+    // delivered -- the load-bearing example for get_yield_vs_deliveries.
+    const vendors = [
+      { id: 'vendor_001', name: 'Al-Karam Sweets', contact: '+92-300-1234567', price_per_litre: 92, status: 'active', weight: 0.45 },
+      { id: 'vendor_002', name: 'Shezan Dairy Traders', contact: '+92-301-2345678', price_per_litre: 88, status: 'active', weight: 0.35 },
+      { id: 'vendor_003', name: 'Gulberg Milk Route', contact: '+92-302-3456789', price_per_litre: 85, status: 'active', weight: 0.2 },
+      { id: 'vendor_004', name: 'Metro Cash & Carry', contact: null, price_per_litre: 95, status: 'inactive', weight: 0 },
+    ];
+    for (const v of vendors) {
+      insertVendor.run({
+        id: v.id,
+        name: v.name,
+        contact: v.contact,
+        price_per_litre: v.price_per_litre,
+        status: v.status,
+      });
+    }
+
+    const activeVendors = vendors.filter((v) => v.status === 'active');
+    // Deliveries span the full milking window so a broad reconciliation query
+    // reflects the one intended mismatch, not a seeding artifact (production
+    // days with no deliveries would otherwise read as a huge false discrepancy).
+    const DELIVERY_DAYS = DAYS;
+    const MISMATCH_HI = 30; // inclusive daysAgo window bounds (10 days)
+    const MISMATCH_LO = 21;
+    const PAID_CUTOFF = 14; // deliveries older than this are settled
+    let delSeq = 0;
+    for (let d = DELIVERY_DAYS - 1; d >= 0; d--) {
+      const date = daysAgo(d);
+      const produced = dailyProduction.get(date) ?? 0;
+      if (produced <= 0) continue;
+      const inMismatch = d <= MISMATCH_HI && d >= MISMATCH_LO;
+      const ratio = inMismatch ? rand(0.6, 0.7) : rand(0.95, 0.99);
+      const sold = produced * ratio;
+      for (const v of activeVendors) {
+        const litres = Math.round(sold * v.weight * 100) / 100;
+        if (litres <= 0) continue;
+        delSeq += 1;
+        insertDelivery.run({
+          id: `delivery_${String(delSeq).padStart(5, '0')}`,
+          vendor_id: v.id,
+          date,
+          litres,
+          price_per_litre: v.price_per_litre,
+          paid: d > PAID_CUTOFF ? 1 : 0,
+        });
+      }
+    }
   });
 
   run();
@@ -142,6 +209,8 @@ function seed(): void {
     milkings: (db.prepare(`SELECT COUNT(*) AS n FROM milkings`).get() as { n: number }).n,
     feed: (db.prepare(`SELECT COUNT(*) AS n FROM feed_inventory`).get() as { n: number }).n,
     health: (db.prepare(`SELECT COUNT(*) AS n FROM health_events`).get() as { n: number }).n,
+    vendors: (db.prepare(`SELECT COUNT(*) AS n FROM vendors`).get() as { n: number }).n,
+    deliveries: (db.prepare(`SELECT COUNT(*) AS n FROM deliveries`).get() as { n: number }).n,
   };
   console.log('Seeded dairy.db:', counts);
 }

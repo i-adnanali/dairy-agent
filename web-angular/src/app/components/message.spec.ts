@@ -25,6 +25,7 @@ describe('Message', () => {
         { toolUseId: 't1', name: 'get_milk_timeseries', status: 'done', argSummary: '{}' },
       ],
       datasets: [],
+      agent: 'dairy',
     };
     const fixture = TestBed.createComponent(Message);
     fixture.componentRef.setInput('item', item);
@@ -34,5 +35,7 @@ describe('Message', () => {
     // markdown renders bold as <strong>
     expect(el.querySelector('strong')?.textContent).toBe('summary');
     expect(el.querySelector('app-tool-call-chip')).toBeTruthy();
+    // the per-turn agent tag (Cycle 2) renders the selected agent
+    expect(el.textContent).toContain('dairy');
   });
 });

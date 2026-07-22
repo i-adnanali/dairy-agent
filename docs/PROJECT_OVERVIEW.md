@@ -250,12 +250,13 @@ The system is designed so that mistakes are caught before they become expensive 
 
 ## 8. Data model
 
-SQLite schema from [server/src/db.ts](../server/src/db.ts). `animals` is the hub; `milkings` and `health_events` reference it by `animal_id`. `feed_inventory` is standalone.
+SQLite schema from [server/src/db.ts](../server/src/db.ts). `animals` is the hub; `milkings` and `health_events` reference it by `animal_id`. `feed_inventory` is standalone. As of Cycle 2 (multi-agent, see [MULTI_AGENT.md](MULTI_AGENT.md)) two vendor-domain tables were added: `vendors` and `deliveries`. `deliveries` and `milkings` are **not** linked by a foreign key — they belong to different agents' domains and are only ever joined read-only, by the reconciliation tool `get_yield_vs_deliveries`.
 
 ```mermaid
 erDiagram
     animals ||--o{ milkings : "has"
     animals ||--o{ health_events : "has"
+    vendors ||--o{ deliveries : "has"
 
     animals {
         text id PK
@@ -288,6 +289,21 @@ erDiagram
         real quantity_kg
         real daily_consumption_kg
         real reorder_threshold_kg
+    }
+    vendors {
+        text id PK
+        text name
+        text contact "nullable"
+        real price_per_litre
+        text status "active | inactive"
+    }
+    deliveries {
+        text id PK
+        text vendor_id FK
+        text date
+        real litres
+        real price_per_litre "captured at delivery time"
+        integer paid "0 | 1"
     }
 ```
 

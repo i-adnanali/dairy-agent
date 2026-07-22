@@ -2,21 +2,24 @@ import { randomUUID } from 'node:crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import { EventType } from '@ag-ui/core';
 import type { BaseEvent } from '@ag-ui/core';
-import type { Approval, Dataset, PendingWrite } from '@dairy/shared';
+import type { Approval, Dataset, PendingWrite, ToolError } from '@dairy/shared';
 import {
-  DAIRY_DATASET_EVENT,
-  DAIRY_MESSAGES_EVENT,
-  DAIRY_PENDING_EVENT,
+  AGENT_DATASET_EVENT,
+  AGENT_MESSAGES_EVENT,
+  AGENT_PENDING_EVENT,
+  AGENT_SELECTION_EVENT,
 } from '@dairy/shared';
+import type { ToolSchema } from '../tools';
 import {
-  ALL_TOOLS,
   READ_EXECUTORS,
   READ_TOOL_NAMES,
   WRITE_EXECUTORS,
   WRITE_TOOL_NAMES,
   guardIds,
+  toolsForAgent,
 } from '../tools';
 import { isToolError } from '../tools/reads';
+import { selectAgent } from './dispatch';
 import { buildSystemPrompt } from './systemPrompt';
 import {
   startActiveObservation,
@@ -81,7 +84,7 @@ function toolUsesOf(content: ContentBlock[]): ToolUse[] {
 /** Emit the full opaque history so the client can store and resend it next turn
  * (Decision 2 - the server stays stateless). */
 function emitHistory(emit: Emit, messages: AnyMessage[]): void {
-  emit({ type: EventType.CUSTOM, name: DAIRY_MESSAGES_EVENT, value: messages } as BaseEvent);
+  emit({ type: EventType.CUSTOM, name: AGENT_MESSAGES_EVENT, value: messages } as BaseEvent);
 }
 
 /**
@@ -91,6 +94,7 @@ function emitHistory(emit: Emit, messages: AnyMessage[]): void {
 async function streamModelTurn(
   model: string,
   system: string,
+  tools: ToolSchema[],
   messages: AnyMessage[],
   emit: Emit,
 ): Promise<Anthropic.Message> {
@@ -111,7 +115,7 @@ async function streamModelTurn(
       model,
       max_tokens: MAX_TOKENS,
       system,
-      tools: ALL_TOOLS as unknown as Anthropic.Tool[],
+      tools: tools as unknown as Anthropic.Tool[],
       messages,
     });
 
@@ -203,6 +207,7 @@ async function streamModelTurn(
  * emitted yet, so a mid-stream failure never double-emits. */
 async function streamWithFallback(
   system: string,
+  tools: ToolSchema[],
   messages: AnyMessage[],
   emit: Emit,
 ): Promise<Anthropic.Message> {
@@ -212,11 +217,11 @@ async function streamWithFallback(
     emit(e);
   };
   try {
-    return await streamModelTurn(DEFAULT_MODEL, system, messages, counting);
+    return await streamModelTurn(DEFAULT_MODEL, system, tools, messages, counting);
   } catch (err: unknown) {
     const status = (err as { status?: number })?.status;
     if ((status === 404 || status === 400) && emitted === 0) {
-      return await streamModelTurn(FALLBACK_MODEL, system, messages, emit);
+      return await streamModelTurn(FALLBACK_MODEL, system, tools, messages, emit);
     }
     throw err;
   }
@@ -284,7 +289,7 @@ function runReads(emit: Emit, reads: ToolUse[], emitUi: boolean): ReadRunResult 
       if (dataset) {
         emit({
           type: EventType.CUSTOM,
-          name: DAIRY_DATASET_EVENT,
+          name: AGENT_DATASET_EVENT,
           value: dataset satisfies Dataset,
         } as BaseEvent);
       }
@@ -311,19 +316,30 @@ function runReads(emit: Emit, reads: ToolUse[], emitUi: boolean): ReadRunResult 
 
 type FinishReason = 'completed' | 'awaiting_approval' | 'iteration_cap';
 
-/** Best-effort plain-text of the most recent user message, for the trace input. */
-function latestUserText(messages: AnyMessage[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
+/** All user-*typed* message texts in order. Skips tool_result-only user turns
+ * (content is tool_result blocks with no text), so it reflects what the person
+ * actually asked -- used for dispatch and the trace input. */
+function typedUserTexts(messages: AnyMessage[]): string[] {
+  const out: string[] = [];
+  for (const m of messages) {
     if (m.role !== 'user') continue;
-    if (typeof m.content === 'string') return m.content;
+    if (typeof m.content === 'string') {
+      if (m.content) out.push(m.content);
+      continue;
+    }
     const text = (m.content as ContentBlock[])
       .filter((b): b is Anthropic.TextBlockParam => b.type === 'text')
       .map((b) => b.text)
       .join('\n');
-    if (text) return text;
+    if (text) out.push(text);
   }
-  return '';
+  return out;
+}
+
+/** Best-effort plain-text of the most recent user message, for the trace input. */
+function latestUserText(messages: AnyMessage[]): string {
+  const texts = typedUserTexts(messages);
+  return texts[texts.length - 1] ?? '';
 }
 
 /** Concatenated assistant text blocks, for the trace output. */
@@ -355,9 +371,18 @@ async function runAgentStreamTraced({
   approvals,
   emit,
 }: RunStreamArgs): Promise<void> {
-  const system = buildSystemPrompt(todayISO());
   const msgs: AnyMessage[] = [...messages];
   let remainingApprovals = [...(approvals ?? [])];
+
+  // Dispatcher (Cycle 2): pick which agent sees this turn, then offer only that
+  // agent's tools + system prompt to the model. `both` is the safe default and
+  // is the only selection given the reconciliation tool. Computed once per run
+  // so a pause/resume turn stays on the same agent as its original question.
+  const userTexts = typedUserTexts(msgs);
+  const n = userTexts.length;
+  const agent = selectAgent(userTexts[n - 1] ?? '', n >= 2 ? userTexts[n - 2] : undefined);
+  const tools = toolsForAgent(agent);
+  const system = buildSystemPrompt(agent, todayISO());
 
   // Trace-level attributes. threadId is the Langfuse session key so a pause and
   // its resume (a new run on the same threadId) land in one session. The custom
@@ -371,6 +396,7 @@ async function runAgentStreamTraced({
   const finalize = (finishReason: FinishReason, output?: unknown): void => {
     setTraceMetadata({
       finish_reason: finishReason,
+      agent,
       digest_size: totalDigestBytes,
       dataset_rows: totalDatasetRows,
     });
@@ -378,6 +404,8 @@ async function runAgentStreamTraced({
   };
 
   emit({ type: EventType.RUN_STARTED, threadId, runId } as BaseEvent);
+  // Tell the client which agent handled this turn, so the transcript can tag it.
+  emit({ type: EventType.CUSTOM, name: AGENT_SELECTION_EVENT, value: agent } as BaseEvent);
 
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
     const stepName = `iteration-${iteration + 1}`;
@@ -394,7 +422,7 @@ async function runAgentStreamTraced({
     if (lastIsAssistantToolUse) {
       toolUses = toolUsesOf(last.content as ContentBlock[]);
     } else {
-      const finalMessage = await streamWithFallback(system, msgs, emit);
+      const finalMessage = await streamWithFallback(system, tools, msgs, emit);
       msgs.push({ role: 'assistant', content: finalMessage.content });
       if (finalMessage.stop_reason !== 'tool_use') {
         emit({ type: EventType.STEP_FINISHED, stepName } as BaseEvent);
@@ -449,7 +477,7 @@ async function runAgentStreamTraced({
       // belt-and-suspenders; in practice it fights the client - see
       // docs/AGUI_MIGRATION.md.)
       emitHistory(emit, msgs);
-      emit({ type: EventType.CUSTOM, name: DAIRY_PENDING_EVENT, value: cards } as BaseEvent);
+      emit({ type: EventType.CUSTOM, name: AGENT_PENDING_EVENT, value: cards } as BaseEvent);
       finalize('awaiting_approval', { pendingWrites: cards.length });
       emit({
         type: EventType.RUN_FINISHED,
@@ -480,13 +508,29 @@ async function runAgentStreamTraced({
             .end();
           continue;
         }
-        const res = WRITE_EXECUTORS[w.name].execute(input);
+        // Execute defensively: a malformed arg (e.g. a missing required id that
+        // hits a FK constraint, or a non-numeric quantity landing in a NOT NULL
+        // column) throws from better-sqlite3. Convert it to a structured
+        // ToolError result -- "wrong cheaply" -- so the model can read it and
+        // retry, rather than aborting the whole run with a generic RUN_ERROR.
+        let res: unknown;
+        let errored = false;
+        try {
+          res = WRITE_EXECUTORS[w.name].execute(input);
+        } catch (e) {
+          errored = true;
+          res = {
+            error: 'write_failed',
+            message: e instanceof Error ? e.message : String(e),
+          } satisfies ToolError;
+        }
         emitToolResult(emit, w.id, res);
-        writeResults.push(toolResultBlock(w.id, res));
+        writeResults.push(toolResultBlock(w.id, res, errored));
         tool
           .update({
             output: res,
-            metadata: { toolUseId: w.id, kind: 'write', approved: true },
+            ...(errored ? { level: 'ERROR' as const } : {}),
+            metadata: { toolUseId: w.id, kind: 'write', approved: true, writeFailed: errored },
           })
           .end();
       } else {

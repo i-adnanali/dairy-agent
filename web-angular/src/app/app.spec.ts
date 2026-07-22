@@ -19,6 +19,6 @@ describe('App', () => {
     await fixture.whenStable();
     const compiled = fixture.nativeElement as HTMLElement;
     expect(compiled.querySelector('app-chat-panel')).toBeTruthy();
-    expect(compiled.querySelector('h1')?.textContent).toContain('Dairy Farm Agent');
+    expect(compiled.querySelector('h1')?.textContent).toContain('Baghicha Dairy Co.');
   });
 });

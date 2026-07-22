@@ -58,7 +58,7 @@ describe('ChatStore', () => {
         ev('TOOL_CALL_ARGS', { toolCallId: 'x1', delta: '{}' }),
         ev('TOOL_CALL_END', { toolCallId: 'x1' }),
         ev('TOOL_CALL_RESULT', { toolCallId: 'x1', content: '{"count":1}' }),
-        ev('CUSTOM', { name: 'dairy.messages', value: history }),
+        ev('CUSTOM', { name: 'agent.messages', value: history }),
         ev('RUN_FINISHED', { threadId: 't', runId: 'r', outcome: { type: 'success' } }),
       ],
     ];
@@ -90,7 +90,7 @@ describe('ChatStore', () => {
     scripts = [
       [
         ev('RUN_STARTED', { threadId: 't', runId: 'r' }),
-        ev('CUSTOM', { name: 'dairy.messages', value: [{ role: 'user', content: 'hi' }] }),
+        ev('CUSTOM', { name: 'agent.messages', value: [{ role: 'user', content: 'hi' }] }),
         ev('RUN_FINISHED', { threadId: 't', runId: 'r', outcome: { type: 'success' } }),
       ],
     ];
@@ -115,8 +115,8 @@ describe('ChatStore', () => {
         ev('RUN_STARTED', { threadId: 't', runId: 'r' }),
         ev('TOOL_CALL_START', { toolCallId: 'w1', toolCallName: 'log_milking' }),
         ev('TOOL_CALL_END', { toolCallId: 'w1' }),
-        ev('CUSTOM', { name: 'dairy.messages', value: [{ role: 'assistant', content: 'x' }] }),
-        ev('CUSTOM', { name: 'dairy.pending', value: pending }),
+        ev('CUSTOM', { name: 'agent.messages', value: [{ role: 'assistant', content: 'x' }] }),
+        ev('CUSTOM', { name: 'agent.pending', value: pending }),
         ev('RUN_FINISHED', {
           threadId: 't',
           runId: 'r',
@@ -139,9 +139,9 @@ describe('ChatStore', () => {
         ev('RUN_STARTED', { threadId: 't', runId: 'r1' }),
         ev('TOOL_CALL_START', { toolCallId: 'w1', toolCallName: 'log_milking' }),
         ev('TOOL_CALL_END', { toolCallId: 'w1' }),
-        ev('CUSTOM', { name: 'dairy.messages', value: historyAfterInterrupt }),
+        ev('CUSTOM', { name: 'agent.messages', value: historyAfterInterrupt }),
         ev('CUSTOM', {
-          name: 'dairy.pending',
+          name: 'agent.pending',
           value: [{ toolUseId: 'w1', toolName: 'log_milking', summary: 's', details: [] }],
         }),
         ev('RUN_FINISHED', {
@@ -156,7 +156,7 @@ describe('ChatStore', () => {
         ev('TEXT_MESSAGE_START', { messageId: 'm2', role: 'assistant' }),
         ev('TEXT_MESSAGE_CONTENT', { messageId: 'm2', delta: 'Logged.' }),
         ev('TEXT_MESSAGE_END', { messageId: 'm2' }),
-        ev('CUSTOM', { name: 'dairy.messages', value: [{ role: 'assistant', content: 'done' }] }),
+        ev('CUSTOM', { name: 'agent.messages', value: [{ role: 'assistant', content: 'done' }] }),
         ev('RUN_FINISHED', { threadId: 't', runId: 'r2', outcome: { type: 'success' } }),
       ],
     ];
@@ -180,7 +180,7 @@ describe('ChatStore', () => {
       [
         ev('RUN_STARTED', { threadId: 't', runId: 'r' }),
         ev('CUSTOM', {
-          name: 'dairy.pending',
+          name: 'agent.pending',
           value: [{ toolUseId: 'w1', toolName: 'log_milking', summary: 's', details: [] }],
         }),
         ev('RUN_FINISHED', {
@@ -209,5 +209,44 @@ describe('ChatStore', () => {
     await store.send('hi');
     expect(store.error()).toBe('The database has not been seeded yet.');
     expect(store.loading()).toBe(false);
+  });
+
+  it('tags the assistant turn with the agent from AGENT_SELECTION_EVENT', async () => {
+    scripts = [
+      [
+        ev('RUN_STARTED', { threadId: 't', runId: 'r' }),
+        ev('CUSTOM', { name: 'agent.selection', value: 'vendor' }),
+        ev('TEXT_MESSAGE_START', { messageId: 'm1', role: 'assistant' }),
+        ev('TEXT_MESSAGE_CONTENT', { messageId: 'm1', delta: 'here are your vendors' }),
+        ev('TEXT_MESSAGE_END', { messageId: 'm1' }),
+        ev('RUN_FINISHED', { threadId: 't', runId: 'r', outcome: { type: 'success' } }),
+      ],
+    ];
+
+    await store.send('list vendors');
+
+    const log = store.renderLog();
+    // selection arrives before the assistant turn is created, so it is tagged.
+    expect(log[log.length - 1]).toMatchObject({ role: 'assistant', agent: 'vendor' });
+  });
+
+  it('warns on an unrecognized CUSTOM event name but not on a known one', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    scripts = [
+      [
+        ev('RUN_STARTED', { threadId: 't', runId: 'r' }),
+        ev('CUSTOM', { name: 'agent.selection', value: 'dairy' }), // known -> no warn
+        ev('CUSTOM', { name: 'dairy.messages', value: [] }), // stale/renamed-away name -> warn
+        ev('CUSTOM', { name: 'totally.unknown', value: 1 }), // foreign name -> warn
+        ev('RUN_FINISHED', { threadId: 't', runId: 'r', outcome: { type: 'success' } }),
+      ],
+    ];
+
+    await store.send('hi');
+
+    const warned = warn.mock.calls.map((c) => String(c[0]));
+    expect(warned.some((m) => m.includes('dairy.messages'))).toBe(true);
+    expect(warned.some((m) => m.includes('totally.unknown'))).toBe(true);
+    expect(warned.some((m) => m.includes('agent.selection'))).toBe(false);
   });
 });
