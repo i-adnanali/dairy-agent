@@ -3,10 +3,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![CI](https://github.com/i-adnanali/dairy-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/i-adnanali/dairy-agent/actions/workflows/ci.yml)
 
-A working AI **agent** for managing a dairy farm's animals, milk yields, feed, and
-health events. The agent answers questions about the farm **and takes real
-actions** — but every state-changing action is gated behind an explicit human
-confirmation.
+A working AI **multi-agent system** for managing a dairy farm. Two agents share
+one process: a **dairy agent** (animals, milk yields, feed, health events) and a
+**vendor/sales agent** (vendors, deliveries, balances), with one deliberate point
+of contact — reconciling milk *produced* against milk *delivered*. A thin
+per-turn dispatcher routes each message to the right agent (or both). The agents
+answer questions about the farm **and take real actions** — but every
+state-changing action is gated behind an explicit human confirmation.
+
+The multi-agent design (and what was deliberately *not* built — no second
+service/A2A, no orchestrator LLM, no auth) is documented in
+[docs/MULTI_AGENT.md](docs/MULTI_AGENT.md).
 
 ![Welcome state of the dairy agent chat UI](docs/images/welcome_state.png)
 ![Digest table returned by the agent](docs/images/digest_table.png)
@@ -18,7 +25,7 @@ one Express server:
 ```
 dairy-agent/
   shared/       # TypeScript types shared by server + web (single source of truth)
-  server/       # Express + Anthropic SDK orchestrator, SQLite, tools, agent loop
+  server/       # Express + Anthropic SDK orchestrator, SQLite, tools, dispatcher, two agents
   web-angular/  # Angular 22 (standalone, zoneless) + Tailwind + ng2-charts frontend
 ```
 
@@ -38,12 +45,14 @@ The Angular frontend talks to the agent over a single streaming endpoint:
 
 `/api/agent/run` streams the turn as AG-UI events (`RUN_STARTED`,
 `TEXT_MESSAGE_*`, `TOOL_CALL_*`, `RUN_FINISHED`, plus app-specific `CUSTOM`
-events for chart datasets, history, and pending writes), so the Angular UI shows
-text token-by-token and tool-call chips as they happen. Tracing lives one layer
+events — `agent.dataset`, `agent.messages`, `agent.pending`, and `agent.selection`
+for which agent handled the turn), so the Angular UI shows text token-by-token,
+tool-call chips, and a per-turn agent tag as they happen. Tracing lives one layer
 below the transport, in the shared agent logic (tools, read/write split, digest
-shaper, confirmation gating). The Angular port is documented in
+shaper, confirmation gating). The multi-agent design is in
+[docs/MULTI_AGENT.md](docs/MULTI_AGENT.md); the Angular port in
 [docs/ANGULAR_PORT.md](docs/ANGULAR_PORT.md); the AG-UI migration and its design
-decisions are in [docs/AGUI_MIGRATION.md](docs/AGUI_MIGRATION.md).
+decisions in [docs/AGUI_MIGRATION.md](docs/AGUI_MIGRATION.md).
 
 ## Tech stack
 
@@ -193,8 +202,9 @@ What gets traced, per turn:
 - **A tool observation per read/write tool call**, recording the model digest
   (never the raw dataset rows) as output.
 - **Custom trace attributes:** `digest_size` and `dataset_rows` (to correlate
-  response shape with latency/cost) and `finish_reason`
-  (`completed` / `iteration_cap` / `awaiting_approval`).
+  response shape with latency/cost), `finish_reason`
+  (`completed` / `iteration_cap` / `awaiting_approval`), and `agent`
+  (`dairy` / `vendor` / `both` — which agent the dispatcher routed the turn to).
 
 If the `LANGFUSE_*` keys are unset, tracing is silently disabled and the agent
 runs normally.
@@ -215,17 +225,28 @@ schemas live in [`server/src/tools/index.ts`](server/src/tools/index.ts) and the
 system prompt (with a live farm catalog injected) in
 [`server/src/agent/systemPrompt.ts`](server/src/agent/systemPrompt.ts).
 
+The one deliberate, narrow exception to "no hand-written intent parsing" is the
+**dispatcher** ([`server/src/agent/dispatch.ts`](server/src/agent/dispatch.ts)):
+per turn it selects which agent — `dairy`, `vendor`, or `both` (the safe
+default) — sees the turn, and the loop offers only that agent's tools + system
+prompt. It only *routes*; each agent still reasons over its own tools exactly as
+above. Reconciliation (`get_yield_vs_deliveries`) is offered only to `both`,
+since it's the one tool that spans both domains.
+
 ### 2. Read/write split (writes are human-gated)
 
-Read tools ([`server/src/tools/reads.ts`](server/src/tools/reads.ts)) execute
-automatically inside the loop. Write tools
-([`server/src/tools/writes.ts`](server/src/tools/writes.ts)) never run on their
-own: when the model calls one, `runAgentStream` **pauses** and emits a
-`PendingWrite` confirmation card (via the `dairy.pending` CUSTOM event). Nothing is written until the
+Read tools (dairy: [`server/src/tools/reads.ts`](server/src/tools/reads.ts);
+vendor: [`server/src/tools/vendorReads.ts`](server/src/tools/vendorReads.ts))
+execute automatically inside the loop. Write tools (dairy:
+[`server/src/tools/writes.ts`](server/src/tools/writes.ts); vendor:
+[`server/src/tools/vendorWrites.ts`](server/src/tools/vendorWrites.ts)) never run
+on their own: when the model calls one, `runAgentStream` **pauses** and emits a
+`PendingWrite` confirmation card (via the `agent.pending` CUSTOM event). Nothing is written until the
 user approves; the resume path executes only the approved writes and records a
 "declined" tool result for the rest. Re-sending the same approval does not
 double-write, because the server is stateless and only mutates on an explicit
-approval decision in that request.
+approval decision in that request. Both agents share this exact pause/resume
+mechanism.
 
 ### 3. Display data is not reasoning data
 
@@ -244,7 +265,8 @@ with the model digest (not the raw rows) recorded as its output.
   throwing.
 - **Hallucinated IDs are blocked for free.** The ID-integrity guard
   (`guardIds` in [`server/src/tools/index.ts`](server/src/tools/index.ts)) checks
-  every `animal_id`/`group` against the DB *before* any tool runs.
+  every `animal_id`/`group`/`vendor_id`/`delivery_id` against the DB *before* any
+  tool runs.
 - **Oversized requests are capped deterministically.** The shaper coarsens
   `day → week` past 90 days and `→ month` past a year before doing any work, so a
   huge range can't blow up the dataset or the digest.

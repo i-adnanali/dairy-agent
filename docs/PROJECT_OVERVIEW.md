@@ -1,6 +1,6 @@
 # Dairy Farm Agent - Project Overview
 
-A working AI **agent** for managing a dairy farm's animals, milk yields, feed, and health events. It answers questions about the farm **and takes real actions** - but every state-changing action is gated behind an explicit human confirmation. This document explains how the system is put together, with a deliberate focus on the **agentic workflow**.
+A working AI **multi-agent system** for managing a dairy farm. Two agents share one process — a **dairy agent** (animals, milk yields, feed, health events) and a **vendor/sales agent** (vendors, deliveries, balances) — with one deliberate point of contact: reconciling milk *produced* against milk *delivered*. A thin per-turn dispatcher routes each message to the dairy agent, the vendor agent, or both. The agents answer questions about the farm **and take real actions** - but every state-changing action is gated behind an explicit human confirmation. This document explains how the system is put together, with a deliberate focus on the **agentic workflow**; the multi-agent design is in [MULTI_AGENT.md](./MULTI_AGENT.md).
 
 For setup and run instructions, see the [README.md](../README.md). This document is about *how it works*. The transport-layer design decisions (why AG-UI, how the interrupt/resume boundary works) live in [AGUI_MIGRATION.md](./AGUI_MIGRATION.md); the observability design is in [OBSERVABILITY.md](./OBSERVABILITY.md).
 
@@ -8,7 +8,7 @@ For setup and run instructions, see the [README.md](../README.md). This document
 
 ## 1. Summary & design principles
 
-The agent uses the model's native tool-calling to drive everything: there is no hand-written intent parsing. A user message goes to the model together with a set of tool schemas; the model decides which tools to call; the server runs them, feeds results back, and loops until the model produces a final answer.
+Each agent uses the model's native tool-calling to drive everything: there is no hand-written intent parsing *inside* an agent. A user message goes to the model together with a set of tool schemas; the model decides which tools to call; the server runs them, feeds results back, and loops until the model produces a final answer. The one deliberate, narrow exception is a keyword **dispatcher** ([server/src/agent/dispatch.ts](../server/src/agent/dispatch.ts)) that only *routes* each turn to the dairy agent, the vendor agent, or both (the safe default) — it never decides what action to take; each agent then reasons over its own tools exactly as above.
 
 Four principles are made **observably true** in the running app:
 
@@ -53,11 +53,12 @@ flowchart LR
         Store["ChatStore (@ag-ui/client HttpAgent)"]
     end
 
-    subgraph server [server: Express + agent]
+    subgraph server [server: Express + agents]
         Route["POST /api/agent/run (SSE), /api/health"]
         Loop["runAgentStream() agent loop"]
-        Tools["Tool executors (reads / writes)"]
-        Prompt["buildSystemPrompt() + catalog"]
+        Dispatch["selectAgent() -> dairy | vendor | both"]
+        Tools["Tool executors (dairy + vendor reads/writes + reconcile)"]
+        Prompt["buildSystemPrompt(agent) + catalog + vendor catalog"]
     end
 
     SQLite[("SQLite dairy.db")]
@@ -68,11 +69,13 @@ flowchart LR
     Store -->|"AG-UI RunAgentInput (forwardedProps: messages + approvals)"| Route
     Route --> Loop
     Loop <-->|"messages + tool schemas (streamed)"| Anthropic
+    Loop --> Dispatch
     Loop --> Tools
+    Dispatch --> Prompt
     Prompt --> Loop
     Tools --> SQLite
     Loop -->|"digest -> model context"| Anthropic
-    Loop -->|"AG-UI events over SSE (text, tool calls, dairy.* CUSTOM)"| Store
+    Loop -->|"AG-UI events over SSE (text, tool calls, agent.* CUSTOM)"| Store
     Loop -.->|"generation + tool spans"| Langfuse
 
     shared["shared: types (wire contract)"]
@@ -80,7 +83,7 @@ flowchart LR
     shared -.-> server
 ```
 
-Key point: the full chart **datasets** flow from the tool executors back to the browser (over a `dairy.dataset` CUSTOM event) **without ever passing through the model** (see Section 6). Only the compact digest is sent to the Anthropic API.
+Key point: the full chart **datasets** flow from the tool executors back to the browser (over a `agent.dataset` CUSTOM event) **without ever passing through the model** (see Section 6). Only the compact digest is sent to the Anthropic API.
 
 ---
 
@@ -112,11 +115,11 @@ sequenceDiagram
     T->>DB: query
     DB-->>T: rows
     T-->>L: { modelDigest, dataset? }
-    L-->>W: TOOL_CALL_RESULT (digest) + CUSTOM dairy.dataset (chart)
+    L-->>W: TOOL_CALL_RESULT (digest) + CUSTOM agent.dataset (chart)
     Note over L: dataset streamed for the client only
     L->>M: tool_result = digest
     M-->>L: final assistant text (stop_reason != tool_use)
-    L-->>W: TEXT_MESSAGE_* + CUSTOM dairy.messages + RUN_FINISHED
+    L-->>W: TEXT_MESSAGE_* + CUSTOM agent.messages + RUN_FINISHED
     W-->>U: render text + charts
 ```
 
@@ -140,7 +143,7 @@ flowchart TD
     Feed --> Cap
 
     HasWrites -- "yes" --> Unresolved{"Writes without an approval decision?"}
-    Unresolved -- "yes" --> Pause(["emit dairy.pending + RUN_FINISHED (PAUSE)"])
+    Unresolved -- "yes" --> Pause(["emit agent.pending + RUN_FINISHED (PAUSE)"])
     Unresolved -- "no" --> Apply["For each write: approved -> execute; else record 'declined'"]
     Apply --> FeedW["Append read + write results"]
     FeedW --> Cap
@@ -160,7 +163,7 @@ Notes tied to the code:
 
 ## 5. Read/write split & human-in-the-loop
 
-Read tools ([server/src/tools/reads.ts](../server/src/tools/reads.ts)) execute automatically inside the loop. Write tools ([server/src/tools/writes.ts](../server/src/tools/writes.ts)) never run on their own: when the model calls one, `runAgentStream` **pauses** - it emits a `dairy.pending` CUSTOM event carrying the `PendingWrite` cards and ends the run with a plain `RUN_FINISHED`. The client renders an approve/reject card ([web-angular/src/app/components/confirmation-card.ts](../web-angular/src/app/components/confirmation-card.ts)); nothing is written until the user decides.
+Read tools (dairy: [server/src/tools/reads.ts](../server/src/tools/reads.ts); vendor: [server/src/tools/vendorReads.ts](../server/src/tools/vendorReads.ts); reconciliation: [server/src/tools/reconcile.ts](../server/src/tools/reconcile.ts)) execute automatically inside the loop. Write tools (dairy: [server/src/tools/writes.ts](../server/src/tools/writes.ts); vendor: [server/src/tools/vendorWrites.ts](../server/src/tools/vendorWrites.ts)) never run on their own: when the model calls one, `runAgentStream` **pauses** - it emits an `agent.pending` CUSTOM event carrying the `PendingWrite` cards and ends the run with a plain `RUN_FINISHED`. The client renders an approve/reject card ([web-angular/src/app/components/confirmation-card.ts](../web-angular/src/app/components/confirmation-card.ts)); nothing is written until the user decides. Both agents share this exact pause/resume mechanism.
 
 ```mermaid
 sequenceDiagram
@@ -179,7 +182,7 @@ sequenceDiagram
     L->>M: messages + tools
     M-->>L: tool_use = log_milking(...)
     Note over L: write with no approval -> PAUSE
-    L-->>W: CUSTOM dairy.messages + CUSTOM dairy.pending + RUN_FINISHED
+    L-->>W: CUSTOM agent.messages + CUSTOM agent.pending + RUN_FINISHED
     W-->>U: show confirmation card(s)
 
     alt User approves
@@ -207,7 +210,7 @@ Why this is safe:
 - **Partial approval.** When multiple writes are proposed, each gets its own decision; approved ones execute and the rest get a `declined` tool result, so the model can acknowledge exactly what happened.
 - **Guarded again at execution.** Even approved writes pass through `guardIds` before running.
 
-> **Why the pause is a plain `RUN_FINISHED`, not an AG-UI interrupt outcome.** Signalling the pending write via `RUN_FINISHED { outcome: interrupt }` made `@ag-ui/client` track an open interrupt and reject the next run unless it carried a standard `resume[]` array - which conflicts with this app's stateless `forwardedProps.approvals` resume. The pause therefore ends with a plain `RUN_FINISHED` and carries the pending writes purely over the `dairy.pending` CUSTOM event. Full reasoning in [AGUI_MIGRATION.md](./AGUI_MIGRATION.md).
+> **Why the pause is a plain `RUN_FINISHED`, not an AG-UI interrupt outcome.** Signalling the pending write via `RUN_FINISHED { outcome: interrupt }` made `@ag-ui/client` track an open interrupt and reject the next run unless it carried a standard `resume[]` array - which conflicts with this app's stateless `forwardedProps.approvals` resume. The pause therefore ends with a plain `RUN_FINISHED` and carries the pending writes purely over the `agent.pending` CUSTOM event. Full reasoning in [AGUI_MIGRATION.md](./AGUI_MIGRATION.md).
 
 ---
 
@@ -216,7 +219,7 @@ Why this is safe:
 `get_milk_yield` runs through the digest shaper in [server/src/tools/shaper.ts](../server/src/tools/shaper.ts). The shaper produces two very different outputs from the same query:
 
 - a small **digest** (totals, mean, min/max, first/last, period-over-period %) that goes into the model's context as the `tool_result`; and
-- a full **`Dataset`** (every bucket of the time series) that is streamed to the client over a `dairy.dataset` CUSTOM event and rendered as a chart in the browser ([web-angular/src/app/components/chart-card.ts](../web-angular/src/app/components/chart-card.ts)).
+- a full **`Dataset`** (every bucket of the time series) that is streamed to the client over a `agent.dataset` CUSTOM event and rendered as a chart in the browser ([web-angular/src/app/components/chart-card.ts](../web-angular/src/app/components/chart-card.ts)).
 
 The full series **never enters the model's context**. You can watch this in Langfuse: each read tool call is traced as its own observation, with the model digest (not the raw rows) recorded as its output, alongside a `datasetRows` count.
 
@@ -226,7 +229,7 @@ flowchart TD
     Coarsen --> Bucket["Bucket rows by interval"]
     Bucket --> Split{"shapeMilkYield output"}
     Split -->|"small digest: totals, mean, min/max, PoP %"| Model["Model context (tool_result)"]
-    Split -->|"full Dataset: every bucket"| Client["CUSTOM dairy.dataset -> ChartCard"]
+    Split -->|"full Dataset: every bucket"| Client["CUSTOM agent.dataset -> ChartCard"]
     Model --> Reason["Model reasons over stats only"]
     Client --> Chart["User sees the full chart"]
 ```
@@ -240,7 +243,7 @@ This keeps token usage bounded and predictable regardless of how large the under
 The system is designed so that mistakes are caught before they become expensive (in tokens, in bad writes, or in runaway loops):
 
 - **Bad args -> structured errors the model can retry.** Read tools return `{ error: ... }` digests (e.g. `missing_scope`, `unknown_group`, `missing_range`) instead of throwing ([server/src/tools/reads.ts](../server/src/tools/reads.ts)). The model reads the error and self-corrects.
-- **Hallucinated IDs blocked for free.** `guardIds` in [server/src/tools/index.ts](../server/src/tools/index.ts) validates every `animal_id` / `group` (including inside `entries[]`) against the DB **before** any tool runs; on failure it returns a `ToolError` and the tool never executes.
+- **Hallucinated IDs blocked for free.** `guardIds` in [server/src/tools/index.ts](../server/src/tools/index.ts) validates every `animal_id` / `group` / `vendor_id` / `delivery_id` (including inside `entries[]`) against the DB **before** any tool runs; on failure it returns a `ToolError` (`unknown_animal` / `unknown_group` / `unknown_vendor` / `unknown_delivery`) and the tool never executes.
 - **Oversized requests coarsened deterministically.** `coarsenInterval` in [server/src/tools/shaper.ts](../server/src/tools/shaper.ts) collapses `day -> week` past 90 days and `-> month` past a year before doing any work, so a huge range cannot blow up the dataset or the digest.
 - **Bounded loop + capped output.** `MAX_TOKENS = 1500` per call and `MAX_ITERATIONS = 8` in [server/src/agent/stream.ts](../server/src/agent/stream.ts); hitting the cap streams a graceful "narrow it down" message.
 - **Model fallback.** If the configured model string is rejected (HTTP 400/404) before anything has streamed, `streamWithFallback` retries once with a known-good fallback model.
@@ -307,13 +310,13 @@ erDiagram
     }
 ```
 
-The seed ([server/src/seed.ts](../server/src/seed.ts)) creates 14 buffalo (8 Kundi, 6 Nili-Ravi) identified by breed + tag (`name` is `null`), 90 days of morning/evening milkings for each lactating animal (using a fixed RNG for reproducibility), 4 feed rows (one intentionally below its reorder threshold), and ~6 health events (2 due within the next 14 days).
+The seed ([server/src/seed.ts](../server/src/seed.ts)) creates 14 buffalo (8 Kundi, 6 Nili-Ravi) identified by breed + tag (`name` is `null`), 90 days of morning/evening milkings for each lactating animal (using a fixed RNG for reproducibility), 4 feed rows (one intentionally below its reorder threshold), ~6 health events (2 due within the next 14 days), and 4 vendors (one inactive) with deliveries derived from daily production — including one deliberately mismatched window so the reconciliation tool (`get_yield_vs_deliveries`) has a real discrepancy to surface.
 
 ---
 
 ## 9. Wire contract (AG-UI over SSE)
 
-One agent endpoint plus a health check ([server/src/index.ts](../server/src/index.ts)); types in [shared/src/types.ts](../shared/src/types.ts).
+A single agent-run endpoint (`POST /api/agent/run`, shared by both agents) plus a health check ([server/src/index.ts](../server/src/index.ts)); types in [shared/src/types.ts](../shared/src/types.ts).
 
 **`GET /api/health`** -> `{ status: "ok", seeded: true, anthropicKey: <bool> }` once the DB is seeded, else `503` with a "run seed first" hint.
 
@@ -339,9 +342,10 @@ One agent endpoint plus a health check ([server/src/index.ts](../server/src/inde
 | `RUN_STARTED` / `RUN_FINISHED` / `RUN_ERROR` | Run lifecycle. |
 | `TEXT_MESSAGE_START` / `_CONTENT` / `_END` | Assistant text, streamed token-by-token. |
 | `TOOL_CALL_START` / `_ARGS` / `_END` / `_RESULT` | Tool-call chips + the model digest result. |
-| `CUSTOM` `dairy.dataset` (`Dataset`) | Chart data for the client only (never to the model). |
-| `CUSTOM` `dairy.messages` (`AnthropicMessage[]`) | Updated opaque history for the client to store and resend. |
-| `CUSTOM` `dairy.pending` (`PendingWrite[]`) | Writes awaiting approval (the pause payload). |
+| `CUSTOM` `agent.selection` (`AgentKind`) | Which agent handled the turn (`dairy` \| `vendor` \| `both`); emitted at `RUN_STARTED`, tags the turn in the UI. |
+| `CUSTOM` `agent.dataset` (`Dataset`) | Chart data for the client only (never to the model). |
+| `CUSTOM` `agent.messages` (`AnthropicMessage[]`) | Updated opaque history for the client to store and resend. |
+| `CUSTOM` `agent.pending` (`PendingWrite[]`) | Writes awaiting approval (the pause payload). |
 
 The server is **stateless**: it stores nothing between requests. The client owns the conversation and resends `messages` (plus `approvals` when resolving a confirmation) inside `forwardedProps` on the next run. Tracing lives one layer below this transport, in the shared tool-call/model-call logic, so it is decoupled from the wire protocol ([OBSERVABILITY.md](./OBSERVABILITY.md)).
 
@@ -349,7 +353,7 @@ The server is **stateless**: it stores nothing between requests. The client owns
 
 ## 10. Frontend architecture
 
-State lives in a single injectable signal store, [web-angular/src/app/core/chat-store.ts](../web-angular/src/app/core/chat-store.ts): `messages` (the conversation resent each turn), `renderLog` (the `TurnItem[]` to display), `pending` (confirmation cards awaiting a decision), plus `loading` and `error`, and two derived `computed`s (`busy`, `isEmpty`). `send()` opens a run with a new user message; `resolve()` opens a fresh run that resends the unchanged `messages` plus `approvals`. Both drive `@ag-ui/client`'s `HttpAgent`; a single `handleEvent()` maps each AG-UI event onto the signals (text deltas append to the in-progress assistant turn, `TOOL_CALL_*` build chips, `dairy.dataset` appends charts, `dairy.pending` sets the confirmation cards).
+State lives in a single injectable signal store, [web-angular/src/app/core/chat-store.ts](../web-angular/src/app/core/chat-store.ts): `messages` (the conversation resent each turn), `renderLog` (the `TurnItem[]` to display), `pending` (confirmation cards awaiting a decision), plus `loading` and `error`, and two derived `computed`s (`busy`, `isEmpty`). `send()` opens a run with a new user message; `resolve()` opens a fresh run that resends the unchanged `messages` plus `approvals`. Both drive `@ag-ui/client`'s `HttpAgent`; a single `handleEvent()` maps each AG-UI event onto the signals (text deltas append to the in-progress assistant turn, `TOOL_CALL_*` build chips, `agent.dataset` appends charts, `agent.pending` sets the confirmation cards, `agent.selection` tags the turn with which agent handled it).
 
 ```mermaid
 flowchart TD
@@ -368,7 +372,7 @@ flowchart TD
     ConfirmationCard -->|"resolve(approvals)"| Store
 ```
 
-Every component is **standalone**, `OnPush`, and uses signal-based `input()` / `output()`; `ChatPanel` injects `ChatStore` directly instead of prop-drilling. The app is **zoneless** (`provideZonelessChangeDetection()`), so signal writes are what drive change detection. The `Composer` is disabled while a turn is loading or while confirmation cards are pending (`busy()`), which enforces the human-in-the-loop gate at the UI level too. Charts are driven entirely by the `Dataset`s streamed over `dairy.dataset`. The React -> Angular port details are in [ANGULAR_PORT.md](./ANGULAR_PORT.md).
+Every component is **standalone**, `OnPush`, and uses signal-based `input()` / `output()`; `ChatPanel` injects `ChatStore` directly instead of prop-drilling. The app is **zoneless** (`provideZonelessChangeDetection()`), so signal writes are what drive change detection. The `Composer` is disabled while a turn is loading or while confirmation cards are pending (`busy()`), which enforces the human-in-the-loop gate at the UI level too. Charts are driven entirely by the `Dataset`s streamed over `agent.dataset`. The React -> Angular port details are in [ANGULAR_PORT.md](./ANGULAR_PORT.md).
 
 ---
 

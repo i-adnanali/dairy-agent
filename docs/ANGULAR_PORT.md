@@ -56,12 +56,17 @@ The behavior:
   `handleEvent`.
 - **`handleEvent(event)`** - the AG-UI event mapper (replaces the REST `applyResponse`):
   `TEXT_MESSAGE_CONTENT` appends tokens to the in-progress assistant `TurnItem`;
-  `TOOL_CALL_*` build/patch chips; the `dairy.dataset` / `dairy.messages` / `dairy.pending`
-  CUSTOM events append charts, replace the opaque history, and set `pending`; `RUN_ERROR`
-  sets the error banner.
+  `TOOL_CALL_*` build/patch chips; the `agent.dataset` / `agent.messages` / `agent.pending`
+  CUSTOM events append charts, replace the opaque history, and set `pending`;
+  `agent.selection` tags the in-progress turn with the handling agent
+  (`dairy` / `vendor` / `both`); `RUN_ERROR` sets the error banner. Any
+  unrecognized `CUSTOM` name is logged as a warning (guards against silent
+  event-name drift).
 
-`TurnItem` is ported verbatim in
-[web-angular/src/app/core/turn-item.type.ts](../web-angular/src/app/core/turn-item.type.ts).
+`TurnItem` was originally ported verbatim in
+[web-angular/src/app/core/turn-item.type.ts](../web-angular/src/app/core/turn-item.type.ts);
+Cycle 2 added an `agent: AgentKind | null` field to the assistant variant so each
+rendered turn can show which agent handled it.
 
 ### Diagram A - one send turn
 
@@ -72,7 +77,7 @@ flowchart TD
     Busy -- "no" --> Optim["append user msg to messages + renderLog; loading=true"]
     Optim --> Run["runAgent(messages): HttpAgent.runAgent(forwardedProps, {onEvent})"]
     Run --> Stream["AG-UI events stream in"]
-    Stream --> Handle["handleEvent(): text deltas, tool chips, dairy.* CUSTOM, RUN_ERROR"]
+    Stream --> Handle["handleEvent(): text deltas, tool chips, agent.* CUSTOM, RUN_ERROR"]
     Handle --> Signals["signal updates -> OnPush re-render"]
     Signals --> Done["run ends (RUN_FINISHED/RUN_ERROR) -> loading=false"]
 ```
