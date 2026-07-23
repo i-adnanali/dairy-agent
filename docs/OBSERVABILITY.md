@@ -45,6 +45,7 @@ Reasoning, in order of weight:
 - **Custom trace metadata:**
   - `digest_size` / `dataset_rows` — from the digest/dataset split carried over AG-UI `CUSTOM` events, to later correlate response shape with latency/cost.
   - `finish_reason: completed | awaiting_approval | iteration_cap` — without this flag, these cases can be hard to distinguish from the trace view alone.
+  - `agent: dairy | vendor | both` — which agent the dispatcher selected for the turn (added in Cycle 2; see [MULTI_AGENT.md](./MULTI_AGENT.md)).
 
 ## Addendum — React frontend and `/api/chat` archived
 

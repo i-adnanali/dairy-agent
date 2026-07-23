@@ -22,7 +22,9 @@ interface RunStreamArgs {
 }
 ```
 
-The server is **stateless**: `messages` is the entire conversation (sent by the client every turn inside the run input's `forwardedProps`) and `approvals` is the set of write decisions for this turn. The loop does not *return* a response object; it **streams** AG-UI events through `emit` (text, tool calls, and the `dairy.*` CUSTOM side-channels), and the client reassembles the turn from that event stream. The updated opaque history is streamed back over a `dairy.messages` CUSTOM event and then owned by the client.
+The server is **stateless**: `messages` is the entire conversation (sent by the client every turn inside the run input's `forwardedProps`) and `approvals` is the set of write decisions for this turn. The loop does not *return* a response object; it **streams** AG-UI events through `emit` (text, tool calls, and the `agent.*` CUSTOM side-channels), and the client reassembles the turn from that event stream. The updated opaque history is streamed back over a `agent.messages` CUSTOM event and then owned by the client.
+
+Once per run, before the loop, the **dispatcher** runs: `selectAgent(latestUserText, previousUserText)` ([server/src/agent/dispatch.ts](../server/src/agent/dispatch.ts)) picks `dairy` / `vendor` / `both`; the loop then offers only that agent's tools (`toolsForAgent(agent)`) and builds an agent-specific prompt (`buildSystemPrompt(agent, today)`). The choice is emitted to the client as an `agent.selection` CUSTOM event right after `RUN_STARTED` and recorded on the trace (`agent` metadata). Because it's derived from the (unchanged) user-typed history, a pause and its resume recompute the *same* agent.
 
 `runAgentStream` wraps the whole turn in a Langfuse root observation (`startActiveObservation('agent-run', ...)`), so one turn is one trace; see [OBSERVABILITY.md](./OBSERVABILITY.md).
 
@@ -42,13 +44,13 @@ The body is a bounded `for (let iteration = 0; iteration < MAX_ITERATIONS; itera
 1. **Resume check.** If the last message is an assistant message that already contains `tool_use` blocks (`lastIsAssistantToolUse`), the loop is *resuming* after a confirmation pause: it reuses those tool calls and does **not** call the model again.
 2. **Otherwise stream the model.** `streamWithFallback(system, messages, emit)` opens `anthropic.messages.stream()` and translates its deltas into AG-UI `TEXT_MESSAGE_*` / `TOOL_CALL_*` events; the assembled assistant reply is pushed onto `messages`. If `stop_reason !== 'tool_use'`, the model has produced its final answer -> emit `RUN_FINISHED` (the text was already streamed) and return.
 3. **Split tool calls.** `tool_use` blocks are partitioned into `reads` (`READ_TOOL_NAMES`) and `writes` (`WRITE_TOOL_NAMES`).
-4. **Run reads** (always; they are idempotent). Each read is guarded (`guardIds`), executed, and emitted as a `TOOL_CALL_RESULT` carrying the digest; any produced `dataset` is streamed to the client over a `dairy.dataset` CUSTOM event. On a resume run the read UI events are suppressed (already emitted in the run that proposed the write) and the read re-executes silently for the model only.
+4. **Run reads** (always; they are idempotent). Each read is guarded (`guardIds`), executed, and emitted as a `TOOL_CALL_RESULT` carrying the digest; any produced `dataset` is streamed to the client over a `agent.dataset` CUSTOM event. On a resume run the read UI events are suppressed (already emitted in the run that proposed the write) and the read re-executes silently for the model only.
 5. **If no writes:** append the read results as a `user` message and continue to the next iteration so the model can digest and answer.
 6. **If writes exist:** enforce the human-in-the-loop gate (Section 1.3).
 
 ### 1.3 The write gate: pause and resume
 
-- **Unresolved writes** (a write `tool_use` with no matching `approvals` entry) cause the loop to build `PendingWrite` cards, emit them over a `dairy.pending` CUSTOM event, and **end the run** with a plain `RUN_FINISHED` (deliberately *not* an AG-UI `outcome: interrupt` — see Section 2.6 and [AGUI_MIGRATION.md](./AGUI_MIGRATION.md)). Nothing is executed. The client renders the cards.
+- **Unresolved writes** (a write `tool_use` with no matching `approvals` entry) cause the loop to build `PendingWrite` cards, emit them over a `agent.pending` CUSTOM event, and **end the run** with a plain `RUN_FINISHED` (deliberately *not* an AG-UI `outcome: interrupt` — see Section 2.6 and [AGUI_MIGRATION.md](./AGUI_MIGRATION.md)). Nothing is executed. The client renders the cards.
 - **Resolved writes** (every write has a decision) are applied: for each `approved` write, `guardIds` runs again and then `WRITE_EXECUTORS[name].execute(input)`; each rejected write records a `{ declined: true }` tool result instead. Read + write results are appended and `remainingApprovals` is cleared (consumed once), so a resend cannot re-apply them.
 
 ### 1.4 Message assembly helpers
@@ -62,7 +64,7 @@ The body is a bounded `for (let iteration = 0; iteration < MAX_ITERATIONS; itera
 ### 1.5 Exit conditions
 
 - **Normal:** model stops calling tools (`stop_reason !== 'tool_use'`) -> `RUN_FINISHED` (trace `finish_reason: completed`).
-- **Pause:** unresolved writes -> `dairy.pending` CUSTOM event + `RUN_FINISHED` (trace `finish_reason: awaiting_approval`).
+- **Pause:** unresolved writes -> `agent.pending` CUSTOM event + `RUN_FINISHED` (trace `finish_reason: awaiting_approval`).
 - **Cap:** the `for` loop exhausts `MAX_ITERATIONS` -> streams a graceful "This request got too involved... narrow it down" message, then `RUN_FINISHED` (trace `finish_reason: iteration_cap`). This is a normal completion, not a failure.
 - **Error:** a genuine failure (Anthropic API error, a tool executor throwing) surfaces as `RUN_ERROR`, not `RUN_FINISHED`.
 
@@ -81,7 +83,7 @@ flowchart TD
     DS -- "no" --> Skip["(no dataset)"]
 
     Kind -- "write" --> Dec{"approval decision present?"}
-    Dec -- "no" --> Card["build PendingWrite card -> emit dairy.pending -> PAUSE (RUN_FINISHED)"]
+    Dec -- "no" --> Card["build PendingWrite card -> emit agent.pending -> PAUSE (RUN_FINISHED)"]
     Dec -- "approved" --> GW["guardIds(input)"]
     GW -- "error" --> WErr["tool_result: ToolError"]
     GW -- "ok" --> WExec["WRITE_EXECUTORS[name].execute(input)"]
@@ -101,6 +103,8 @@ The design goal is "wrong cheaply, never expensively": bad inputs, hallucinated 
 
 - `args.animal_id` -> must exist, else `{ error: 'unknown_animal', animal_id }`.
 - `args.group` -> must exist, else `{ error: 'unknown_group', group }`.
+- `args.vendor_id` -> must exist, else `{ error: 'unknown_vendor', vendor_id }`.
+- `args.delivery_id` -> must exist, else `{ error: 'unknown_delivery', delivery_id }`.
 - every `args.entries[].animal_id` (used by `log_milking`) -> must exist.
 
 Returns a `ToolError | null`. It runs for **reads** and **again for each approved write** just before execution, so an approval cannot smuggle a bad id past the guard.
@@ -112,7 +116,9 @@ Read executors ([server/src/tools/reads.ts](../server/src/tools/reads.ts)) retur
 - `missing_scope` - `get_milk_yield` called with neither `animal_id` nor `group`.
 - `missing_range` - `get_milk_yield` missing `from`/`to`.
 - `unknown_animal` / `unknown_group` - scope resolves to zero animals.
+- `unknown_vendor` - `get_vendor` / `get_deliveries` given a `vendor_id` that doesn't exist.
 - `missing_query` - `search_animals` called with an empty query.
+- `missing_range` - `get_deliveries` / `get_yield_vs_deliveries` missing `from`/`to`.
 
 ### 2.3 Deterministic coarsening
 
@@ -134,7 +140,7 @@ When it fires, the digest carries `coarsened: true` and a `coarsenNote` so the m
 
 ### 2.6 Read/write split and the human gate
 
-Reads execute automatically; writes never do. A write `tool_use` pauses the loop — the run ends with a `dairy.pending` CUSTOM event (carrying the `PendingWrite` cards) plus a plain `RUN_FINISHED`; nothing is written until the client opens a resume run whose `forwardedProps.approvals` carries an `Approval` with `approved: true`. The pause is signalled via `dairy.pending` rather than an AG-UI `RUN_FINISHED { outcome: interrupt }`, because the interrupt outcome makes `@ag-ui/client` reject the next run unless it carries a standard `resume[]` array — which fights this app's stateless `forwardedProps.approvals` resume (see [AGUI_MIGRATION.md](./AGUI_MIGRATION.md)).
+Reads execute automatically; writes never do. A write `tool_use` pauses the loop — the run ends with a `agent.pending` CUSTOM event (carrying the `PendingWrite` cards) plus a plain `RUN_FINISHED`; nothing is written until the client opens a resume run whose `forwardedProps.approvals` carries an `Approval` with `approved: true`. The pause is signalled via `agent.pending` rather than an AG-UI `RUN_FINISHED { outcome: interrupt }`, because the interrupt outcome makes `@ag-ui/client` reject the next run unless it carries a standard `resume[]` array — which fights this app's stateless `forwardedProps.approvals` resume (see [AGUI_MIGRATION.md](./AGUI_MIGRATION.md)).
 
 ### 2.7 Stateless approvals / no double-write
 
@@ -151,11 +157,11 @@ flowchart LR
     Exec["Tool executor"] --> Digest["modelDigest"]
     Exec --> Dataset["dataset (optional)"]
     Digest --> Model["Model context (tool_result)"]
-    Dataset --> Client["CUSTOM dairy.dataset -> charts (never to model)"]
+    Dataset --> Client["CUSTOM agent.dataset -> charts (never to model)"]
 
     Digest -.->|"digest is a ToolError"| Retry["Model reads error and retries"]
 
-    Write["Write tool_use"] --> Pending["PendingWrite card (CUSTOM dairy.pending)"]
+    Write["Write tool_use"] --> Pending["PendingWrite card (CUSTOM agent.pending)"]
     Pending --> UI["Client approval UI (run ends with RUN_FINISHED)"]
 ```
 
@@ -163,7 +169,7 @@ flowchart LR
 
 ## Section 3 - Tool contracts
 
-Schemas: [server/src/tools/index.ts](../server/src/tools/index.ts). Executors: [server/src/tools/reads.ts](../server/src/tools/reads.ts), [server/src/tools/writes.ts](../server/src/tools/writes.ts). Shared types: [shared/src/types.ts](../shared/src/types.ts).
+Schemas: [server/src/tools/index.ts](../server/src/tools/index.ts). Executors: dairy in [server/src/tools/reads.ts](../server/src/tools/reads.ts) + [server/src/tools/writes.ts](../server/src/tools/writes.ts); vendor in [server/src/tools/vendorReads.ts](../server/src/tools/vendorReads.ts) + [server/src/tools/vendorWrites.ts](../server/src/tools/vendorWrites.ts); reconciliation in [server/src/tools/reconcile.ts](../server/src/tools/reconcile.ts). Which schemas are offered on a given turn is chosen by the dispatcher (`toolsForAgent(agent)`): the dairy set, the vendor set, or all + `get_yield_vs_deliveries` for `both`. Shared types: [shared/src/types.ts](../shared/src/types.ts).
 
 ### 3.1 Plumbing types
 
@@ -191,12 +197,15 @@ type AgentRunForwardedProps = {
   approvals?: Approval[];        // approval decisions on a resume run
 };
 
-const DAIRY_DATASET_EVENT = 'dairy.dataset';   // value: Dataset      (chart only)
-const DAIRY_MESSAGES_EVENT = 'dairy.messages'; // value: AnthropicMessage[]
-const DAIRY_PENDING_EVENT = 'dairy.pending';   // value: PendingWrite[]
+type AgentKind = 'dairy' | 'vendor' | 'both';  // which agent the dispatcher picked
+
+const AGENT_DATASET_EVENT = 'agent.dataset';     // value: Dataset      (chart only)
+const AGENT_MESSAGES_EVENT = 'agent.messages';   // value: AnthropicMessage[]
+const AGENT_PENDING_EVENT = 'agent.pending';     // value: PendingWrite[]
+const AGENT_SELECTION_EVENT = 'agent.selection'; // value: AgentKind (emitted at RUN_STARTED)
 ```
 
-A read executor returns a **`modelDigest`** (small, enters the model context) and optionally a **`dataset`** (full, streamed to the client over `dairy.dataset` only). A write executor exposes `buildCard()` (the `PendingWrite`) and `execute()` (the mutation).
+A read executor returns a **`modelDigest`** (small, enters the model context) and optionally a **`dataset`** (full, streamed to the client over `agent.dataset` only). A write executor exposes `buildCard()` (the `PendingWrite`) and `execute()` (the mutation).
 
 ### 3.2 Read tools
 
@@ -210,6 +219,15 @@ Every read returns `{ modelDigest }`; only `get_milk_yield` also returns a `data
 | `search_animals` | `{ query }` (required) | `{ count, tooMany, totalMatches, animals: [{ id, tag, name, breed, status, group_name }] }` (top-K = 8) | `missing_query` |
 | `get_feed_status` | `{}` | `{ items: [{ feed_type, quantity_kg, daily_consumption_kg, reorder_threshold_kg, belowThreshold, daysRemaining }], anyBelowThreshold }` | - |
 | `get_health_events` | `{ animal_id?, due_within_days? }` | `{ count, events: [{ id, animal_id, tag, name, date, type, notes, next_due_date }] }` | `unknown_animal` |
+
+Vendor / reconciliation reads (offered when the dispatcher selects `vendor` or `both`):
+
+| Tool | Input schema | `modelDigest` shape | Error codes |
+|---|---|---|---|
+| `list_vendors` | `{ status? }` | `{ count, vendors: [{ id, name, status, price_per_litre }] }` | - |
+| `get_vendor` | `{ vendor_id }` (required) | `{ vendor, outstandingBalance, unpaidDeliveries, totalDeliveries, totalLitresDelivered, lastDeliveryDate, recentDeliveries }` | `unknown_vendor` |
+| `get_deliveries` | `{ vendor_id?, from, to }` (`from/to` required) | `{ scope, from, to, count, totalLitres, totalValue, unpaidValue, byVendor: [...] }` | `missing_range`, `unknown_vendor` |
+| `get_yield_vs_deliveries` | `{ from, to }` (required; `both` only) | `{ from, to, producedLitres, deliveredLitres, discrepancyLitres, discrepancyPct, tolerancePct, flagged }` | `missing_range` |
 
 ### 3.3 `get_milk_yield`: digest vs dataset
 
@@ -239,7 +257,7 @@ The single most important contract for "display data is not reasoning data" ([se
 // DatasetPoint = { periodStart, totalLitres, avgPerAnimal }
 ```
 
-The `points` array (every bucket) is the full time series. It is streamed to the client over a `dairy.dataset` CUSTOM event and rendered by `ChartCard`; it **never enters the model's context**. The model only ever sees the digest stats.
+The `points` array (every bucket) is the full time series. It is streamed to the client over a `agent.dataset` CUSTOM event and rendered by `ChartCard`; it **never enters the model's context**. The model only ever sees the digest stats.
 
 ### 3.4 Write tools
 
@@ -251,7 +269,13 @@ All writes are confirmation-gated. `buildCard()` shapes the `PendingWrite`; `exe
 - **`update_feed_inventory`** - input `{ feed_type, quantity_kg (>=0) }` required. `execute` runs `UPDATE feed_inventory SET quantity_kg=? WHERE feed_type=?` -> `{ updated, feed_type, quantity_kg }`.
 - **`schedule_health_event`** - input `{ animal_id, type, next_due_date }` required; `notes?` optional. `execute` inserts a `health_events` row dated today with the future `next_due_date` -> `{ created: true, id, next_due_date }`.
 
-Card label helper: `tagLabel(animalId)` renders `TAG (name)` when a name exists, otherwise just the tag - so with the current name-less seed, cards read by tag (e.g. `B-001`).
+Vendor writes ([server/src/tools/vendorWrites.ts](../server/src/tools/vendorWrites.ts)), same confirmation-gated pattern:
+
+- **`register_vendor`** - input `{ name, price_per_litre }` required; `contact?, status?` optional (`status` whitelisted to `active`/`inactive`, default `active`). Validates a non-empty name and a finite `price_per_litre >= 0`. `execute` inserts a `vendors` row -> `{ created: true, id, name }`.
+- **`record_delivery`** - input `{ vendor_id, date, litres }` required. The `price_per_litre` is captured from the vendor at call time (a later vendor price change never rewrites past deliveries). Validates a finite `litres > 0`. `execute` inserts a `deliveries` row (`paid = 0`) -> `{ created: true, id, litres, price_per_litre, value }`.
+- **`mark_delivery_paid`** - input `{ delivery_id }` required. `execute` runs `UPDATE deliveries SET paid = 1 WHERE id = ?` -> `{ updated, delivery_id }`.
+
+Card label helper: `tagLabel(animalId)` renders `TAG (name)` when a name exists, otherwise just the tag - so with the current name-less seed, cards read by tag (e.g. `B-001`). Vendor cards use `vendorLabel(vendorId)` (the vendor's name).
 
 ---
 

@@ -113,6 +113,12 @@ AG-UI message/state events:
 | `dairy.messages` | `AnthropicMessage[]`       | Updated opaque history for the client to store and resend.    |
 | `dairy.pending`  | `PendingWrite[]`           | Writes awaiting approval (Decision 2 interrupt payload).      |
 
+> **Renamed in Cycle 2 (`v0.5.0`).** These `dairy.*` names are now `agent.*`
+> (`agent.dataset` / `agent.messages` / `agent.pending`), with a new
+> `agent.selection` event (which agent handled the turn). This section preserves
+> the names as built during the AG-UI migration; the rename rationale is in
+> [MULTI_AGENT.md](./MULTI_AGENT.md).
+
 The lifecycle, text, and tool-call events are all native AG-UI events.
 
 ### Where a Phase-0 decision changed in practice: the interrupt outcome
