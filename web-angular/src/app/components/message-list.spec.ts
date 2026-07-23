@@ -6,7 +6,7 @@ describe('MessageList', () => {
   it('renders one app-message per render-log item', () => {
     const log: TurnItem[] = [
       { id: 'u1', role: 'user', text: 'hi' },
-      { id: 'a1', role: 'assistant', text: 'hello', toolCalls: [], datasets: [] },
+      { id: 'a1', role: 'assistant', text: 'hello', toolCalls: [], datasets: [], agent: null },
     ];
     const fixture = TestBed.createComponent(MessageList);
     fixture.componentRef.setInput('renderLog', log);

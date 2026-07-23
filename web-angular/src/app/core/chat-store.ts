@@ -3,6 +3,7 @@ import { HttpAgent } from '@ag-ui/client';
 import { EventType } from '@ag-ui/core';
 import type { BaseEvent } from '@ag-ui/core';
 import type {
+  AgentKind,
   AgentRunForwardedProps,
   AnthropicMessage,
   Approval,
@@ -11,9 +12,10 @@ import type {
   ToolCallView,
 } from '@dairy/shared';
 import {
-  DAIRY_DATASET_EVENT,
-  DAIRY_MESSAGES_EVENT,
-  DAIRY_PENDING_EVENT,
+  AGENT_DATASET_EVENT,
+  AGENT_MESSAGES_EVENT,
+  AGENT_PENDING_EVENT,
+  AGENT_SELECTION_EVENT,
 } from '@dairy/shared';
 import type { TurnItem } from './turn-item.type';
 
@@ -46,6 +48,7 @@ export class ChatStore {
 
   // Per-run streaming state.
   private currentAssistantId: string | null = null;
+  private currentAgent: AgentKind | null = null;
   private readonly argsBuffer = new Map<string, string>();
   private readonly toolNames = new Map<string, string>();
 
@@ -69,6 +72,7 @@ export class ChatStore {
   private async runAgent(messages: AnthropicMessage[], approvals?: Approval[]): Promise<void> {
     this.loading.set(true);
     this.currentAssistantId = null;
+    this.currentAgent = null;
     this.argsBuffer.clear();
     this.toolNames.clear();
     const forwardedProps: AgentRunForwardedProps = { messages, approvals };
@@ -92,6 +96,7 @@ export class ChatStore {
     switch (event.type) {
       case EventType.RUN_STARTED:
         this.currentAssistantId = null;
+        this.currentAgent = null;
         this.argsBuffer.clear();
         this.toolNames.clear();
         break;
@@ -132,11 +137,34 @@ export class ChatStore {
       case EventType.CUSTOM: {
         const name = readString(event, 'name');
         const value = (event as unknown as { value?: unknown }).value;
-        if (name === DAIRY_DATASET_EVENT && value) this.addDataset(value as Dataset);
-        else if (name === DAIRY_MESSAGES_EVENT && Array.isArray(value)) {
-          this.messages.set(value as AnthropicMessage[]);
-        } else if (name === DAIRY_PENDING_EVENT && Array.isArray(value)) {
-          this.pending.set(value as PendingWrite[]);
+        switch (name) {
+          case AGENT_DATASET_EVENT:
+            if (value) this.addDataset(value as Dataset);
+            break;
+          case AGENT_MESSAGES_EVENT:
+            if (Array.isArray(value)) this.messages.set(value as AnthropicMessage[]);
+            break;
+          case AGENT_PENDING_EVENT:
+            if (Array.isArray(value)) this.pending.set(value as PendingWrite[]);
+            break;
+          case AGENT_SELECTION_EVENT:
+            if (typeof value === 'string') {
+              this.currentAgent = value as AgentKind;
+              // Arrives before any text; patch the turn too in case one exists.
+              this.updateCurrent((a) => ({ ...a, agent: this.currentAgent }));
+            }
+            break;
+          default:
+            // A CUSTOM event whose name matches NONE of our constants. This
+            // should never happen against the current server; if it does, it
+            // usually means the shared event-name constants are out of sync
+            // (e.g. a stale Vite optimized-deps cache resolving a constant to
+            // undefined), which otherwise fails silently -- history not syncing,
+            // no confirmation card. Make it loud. (A known name with a
+            // malformed payload no-ops above rather than warning here.)
+            if (name) {
+              console.warn(`[chat-store] unhandled CUSTOM event name: ${JSON.stringify(name)}`);
+            }
         }
         break;
       }
@@ -156,7 +184,7 @@ export class ChatStore {
     this.currentAssistantId = id;
     this.renderLog.update((log) => [
       ...log,
-      { id, role: 'assistant', text: '', toolCalls: [], datasets: [] },
+      { id, role: 'assistant', text: '', toolCalls: [], datasets: [], agent: this.currentAgent },
     ]);
   }
 

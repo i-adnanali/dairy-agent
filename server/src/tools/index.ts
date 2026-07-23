@@ -1,7 +1,11 @@
 import type { ToolError } from '@dairy/shared';
-import { animalExists, groupExists } from '../db';
-import { READ_EXECUTORS } from './reads';
-import { WRITE_EXECUTORS } from './writes';
+import type { Agent } from '../agent/dispatch';
+import { animalExists, deliveryExists, groupExists, vendorExists } from '../db';
+import { READ_EXECUTORS as DAIRY_READ_EXECUTORS } from './reads';
+import { WRITE_EXECUTORS as DAIRY_WRITE_EXECUTORS } from './writes';
+import { VENDOR_READ_EXECUTORS } from './vendorReads';
+import { VENDOR_WRITE_EXECUTORS } from './vendorWrites';
+import { RECONCILE_EXECUTORS, RECONCILE_TOOLS } from './reconcile';
 
 export interface ToolSchema {
   name: string;
@@ -167,10 +171,119 @@ export const WRITE_TOOLS: ToolSchema[] = [
   },
 ];
 
-export const ALL_TOOLS: ToolSchema[] = [...READ_TOOLS, ...WRITE_TOOLS];
+// ---------------------------------------------------------------------------
+// Vendor / sales tools (Cycle 2 multi-agent; see docs/MULTI_AGENT.md). Kept in
+// their own schema arrays so the dispatcher (Phase 03) can advertise the dairy
+// set, the vendor set, or both to the model per turn.
+// ---------------------------------------------------------------------------
 
-export const READ_TOOL_NAMES = new Set(READ_TOOLS.map((t) => t.name));
-export const WRITE_TOOL_NAMES = new Set(WRITE_TOOLS.map((t) => t.name));
+export const VENDOR_READ_TOOLS: ToolSchema[] = [
+  {
+    name: 'list_vendors',
+    description:
+      'List milk vendors, optionally filtered by status. Returns a compact list (id, name, status, price_per_litre). Use to enumerate vendors or resolve which vendor a name refers to.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['active', 'inactive'] },
+      },
+    },
+  },
+  {
+    name: 'get_vendor',
+    description:
+      'Get full detail for a single vendor by id: their outstanding balance (value of unpaid deliveries), delivery totals, last delivery date, and up to 10 most recent deliveries.',
+    input_schema: {
+      type: 'object',
+      required: ['vendor_id'],
+      properties: { vendor_id: { type: 'string' } },
+    },
+  },
+  {
+    name: 'get_deliveries',
+    description:
+      'Milk deliveries over a date range for one vendor or all vendors. Returns summary statistics (total litres, total value, unpaid value) plus a per-vendor breakdown. Provide vendor_id to scope to one vendor, or omit it for all.',
+    input_schema: {
+      type: 'object',
+      required: ['from', 'to'],
+      properties: {
+        vendor_id: { type: 'string' },
+        from: { type: 'string', description: 'ISO date YYYY-MM-DD' },
+        to: { type: 'string', description: 'ISO date YYYY-MM-DD' },
+      },
+    },
+  },
+];
+
+export const VENDOR_WRITE_TOOLS: ToolSchema[] = [
+  {
+    name: 'register_vendor',
+    description:
+      'Register a new milk vendor. Confirmation-gated. Provide at least name and price_per_litre; status defaults to active.',
+    input_schema: {
+      type: 'object',
+      required: ['name', 'price_per_litre'],
+      properties: {
+        name: { type: 'string' },
+        contact: { type: 'string' },
+        price_per_litre: { type: 'number', minimum: 0 },
+        status: { type: 'string', enum: ['active', 'inactive'] },
+      },
+    },
+  },
+  {
+    name: 'record_delivery',
+    description:
+      'Record a milk delivery to one vendor. Confirmation-gated; the system shows a confirmation card and writes nothing until the user approves -- do not ask "shall I?" in text, just call with complete arguments. The price per litre is captured from the vendor automatically at delivery time. One vendor and one quantity per call.',
+    input_schema: {
+      type: 'object',
+      required: ['vendor_id', 'date', 'litres'],
+      properties: {
+        vendor_id: { type: 'string' },
+        date: { type: 'string', description: 'ISO date YYYY-MM-DD' },
+        litres: { type: 'number', minimum: 0 },
+      },
+    },
+  },
+  {
+    name: 'mark_delivery_paid',
+    description:
+      'Mark a single delivery as paid (settles it against the vendor balance). Confirmation-gated. Provide the delivery_id.',
+    input_schema: {
+      type: 'object',
+      required: ['delivery_id'],
+      properties: { delivery_id: { type: 'string' } },
+    },
+  },
+];
+
+// Re-export so the dispatcher (Phase 03) can offer reconciliation only for the
+// `both` selection, since it's the one tool that legitimately needs both tables.
+export { RECONCILE_TOOLS };
+
+export const ALL_TOOLS: ToolSchema[] = [
+  ...READ_TOOLS,
+  ...WRITE_TOOLS,
+  ...VENDOR_READ_TOOLS,
+  ...VENDOR_WRITE_TOOLS,
+  ...RECONCILE_TOOLS,
+];
+
+export const READ_TOOL_NAMES = new Set(
+  [...READ_TOOLS, ...VENDOR_READ_TOOLS, ...RECONCILE_TOOLS].map((t) => t.name),
+);
+export const WRITE_TOOL_NAMES = new Set(
+  [...WRITE_TOOLS, ...VENDOR_WRITE_TOOLS].map((t) => t.name),
+);
+
+/** Tool schemas offered to the model for a given dispatcher selection. The
+ * reconciliation tool is offered only to `both`, since it's the one tool that
+ * legitimately needs both domains' tables. */
+export function toolsForAgent(agent: Agent): ToolSchema[] {
+  if (agent === 'dairy') return [...READ_TOOLS, ...WRITE_TOOLS];
+  if (agent === 'vendor') return [...VENDOR_READ_TOOLS, ...VENDOR_WRITE_TOOLS];
+  return ALL_TOOLS;
+}
 
 /**
  * ID-integrity guard (spec 4.3): before executing ANY tool, validate that every
@@ -188,6 +301,16 @@ export function guardIds(args: Record<string, unknown>): ToolError | null {
       return { error: 'unknown_group', group: args.group };
     }
   }
+  if (typeof args.vendor_id === 'string' && args.vendor_id) {
+    if (!vendorExists(args.vendor_id)) {
+      return { error: 'unknown_vendor', vendor_id: args.vendor_id };
+    }
+  }
+  if (typeof args.delivery_id === 'string' && args.delivery_id) {
+    if (!deliveryExists(args.delivery_id)) {
+      return { error: 'unknown_delivery', delivery_id: args.delivery_id };
+    }
+  }
   if (Array.isArray(args.entries)) {
     for (const e of args.entries) {
       const aid = (e as Record<string, unknown>)?.animal_id;
@@ -199,4 +322,12 @@ export function guardIds(args: Record<string, unknown>): ToolError | null {
   return null;
 }
 
-export { READ_EXECUTORS, WRITE_EXECUTORS };
+/** Executor maps merge the dairy and vendor tool sets. Which schemas the model
+ * is *offered* is decided per turn by the dispatcher; execution is looked up by
+ * tool name against these merged maps regardless. */
+export const READ_EXECUTORS = {
+  ...DAIRY_READ_EXECUTORS,
+  ...VENDOR_READ_EXECUTORS,
+  ...RECONCILE_EXECUTORS,
+};
+export const WRITE_EXECUTORS = { ...DAIRY_WRITE_EXECUTORS, ...VENDOR_WRITE_EXECUTORS };

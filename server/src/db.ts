@@ -2,9 +2,11 @@ import Database from 'better-sqlite3';
 import path from 'node:path';
 import type {
   Animal,
+  Delivery,
   FeedInventory,
   HealthEvent,
   Milking,
+  Vendor,
 } from '@dairy/shared';
 
 // dairy.db lives next to the server package root (one level up from src once
@@ -53,11 +55,36 @@ CREATE TABLE health_events (
   notes         TEXT,
   next_due_date TEXT
 );
+
+-- Vendor / sales domain (Cycle 2 multi-agent; see docs/MULTI_AGENT.md).
+-- deliveries and milkings are deliberately NOT linked by a foreign key: they
+-- belong to different agents' domains and are only ever joined read-only, by
+-- the reconciliation tool get_yield_vs_deliveries.
+CREATE TABLE vendors (
+  id              TEXT PRIMARY KEY,
+  name            TEXT NOT NULL,
+  contact         TEXT,
+  price_per_litre REAL NOT NULL,
+  status          TEXT NOT NULL
+);
+
+CREATE TABLE deliveries (
+  id              TEXT PRIMARY KEY,
+  vendor_id       TEXT NOT NULL REFERENCES vendors(id),
+  date            TEXT NOT NULL,
+  litres          REAL NOT NULL,
+  price_per_litre REAL NOT NULL,
+  paid            INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_deliveries_date ON deliveries(date);
+CREATE INDEX idx_deliveries_vendor ON deliveries(vendor_id);
 `;
 
 /** Drop everything and recreate the schema. Used by the seed script. */
 export function resetSchema(): void {
   db.exec(`
+    DROP TABLE IF EXISTS deliveries;
+    DROP TABLE IF EXISTS vendors;
     DROP TABLE IF EXISTS milkings;
     DROP TABLE IF EXISTS health_events;
     DROP TABLE IF EXISTS feed_inventory;
@@ -152,4 +179,100 @@ export function healthEventsForAnimal(animalId: string): HealthEvent[] {
       `SELECT * FROM health_events WHERE animal_id = ? ORDER BY date DESC`,
     )
     .all(animalId) as HealthEvent[];
+}
+
+// ---------------------------------------------------------------------------
+// Vendor / sales read helpers (Cycle 2). deliveries.paid is stored as 0/1 in
+// SQLite; toDelivery() normalizes it to the boolean the Delivery type expects.
+// ---------------------------------------------------------------------------
+
+type DeliveryRow = Omit<Delivery, 'paid'> & { paid: number };
+
+function toDelivery(row: DeliveryRow): Delivery {
+  return { ...row, paid: !!row.paid };
+}
+
+export function getVendorById(id: string): Vendor | undefined {
+  return db.prepare(`SELECT * FROM vendors WHERE id = ?`).get(id) as
+    | Vendor
+    | undefined;
+}
+
+export function vendorExists(id: string): boolean {
+  const row = db
+    .prepare(`SELECT 1 AS x FROM vendors WHERE id = ?`)
+    .get(id) as { x: number } | undefined;
+  return !!row;
+}
+
+export function allVendors(): Vendor[] {
+  return db.prepare(`SELECT * FROM vendors ORDER BY name`).all() as Vendor[];
+}
+
+export function deliveryExists(id: string): boolean {
+  const row = db
+    .prepare(`SELECT 1 AS x FROM deliveries WHERE id = ?`)
+    .get(id) as { x: number } | undefined;
+  return !!row;
+}
+
+export function getDeliveryById(id: string): Delivery | undefined {
+  const row = db.prepare(`SELECT * FROM deliveries WHERE id = ?`).get(id) as
+    | DeliveryRow
+    | undefined;
+  return row ? toDelivery(row) : undefined;
+}
+
+/** Deliveries for one vendor (or all vendors when vendorId is undefined),
+ * bounded to an inclusive date range. */
+export function deliveriesInScope(scope: {
+  vendorId?: string;
+  from: string;
+  to: string;
+}): Delivery[] {
+  const clauses = ['date >= ?', 'date <= ?'];
+  const params: unknown[] = [scope.from, scope.to];
+  if (scope.vendorId) {
+    clauses.push('vendor_id = ?');
+    params.push(scope.vendorId);
+  }
+  const rows = db
+    .prepare(
+      `SELECT * FROM deliveries WHERE ${clauses.join(' AND ')} ORDER BY date ASC`,
+    )
+    .all(...params) as DeliveryRow[];
+  return rows.map(toDelivery);
+}
+
+/** All deliveries for one vendor, newest first (used by get_vendor detail). */
+export function deliveriesForVendor(vendorId: string): Delivery[] {
+  const rows = db
+    .prepare(`SELECT * FROM deliveries WHERE vendor_id = ? ORDER BY date DESC`)
+    .all(vendorId) as DeliveryRow[];
+  return rows.map(toDelivery);
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation (Cycle 2). The one place milkings and deliveries are joined --
+// read-only, by summing each side over a date range. No FK between them.
+// ---------------------------------------------------------------------------
+
+/** Total litres milked across all animals over an inclusive date range. */
+export function sumMilkYield(from: string, to: string): number {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(yield_litres), 0) AS s FROM milkings WHERE date >= ? AND date <= ?`,
+    )
+    .get(from, to) as { s: number };
+  return row.s;
+}
+
+/** Total litres delivered to all vendors over an inclusive date range. */
+export function sumDeliveredLitres(from: string, to: string): number {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(litres), 0) AS s FROM deliveries WHERE date >= ? AND date <= ?`,
+    )
+    .get(from, to) as { s: number };
+  return row.s;
 }

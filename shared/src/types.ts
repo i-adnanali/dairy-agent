@@ -47,6 +47,27 @@ export interface HealthEvent {
   next_due_date: string | null;
 }
 
+// --- Vendor / sales domain (Cycle 2 multi-agent; see docs/MULTI_AGENT.md) ----
+
+export type VendorStatus = 'active' | 'inactive';
+
+export interface Vendor {
+  id: string;
+  name: string;
+  contact: string | null;
+  price_per_litre: number;
+  status: VendorStatus;
+}
+
+export interface Delivery {
+  id: string;
+  vendor_id: string;
+  date: string;
+  litres: number;
+  price_per_litre: number; // captured at delivery time; vendor price may change later
+  paid: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Tool plumbing
 // ---------------------------------------------------------------------------
@@ -132,10 +153,17 @@ export type AgentRunForwardedProps = {
   approvals?: Approval[]; // approval decisions on a resume run
 };
 
-/** CUSTOM event names used as app-specific side-channels over AG-UI. */
-export const DAIRY_DATASET_EVENT = 'dairy.dataset'; // value: Dataset
-export const DAIRY_MESSAGES_EVENT = 'dairy.messages'; // value: AnthropicMessage[]
-export const DAIRY_PENDING_EVENT = 'dairy.pending'; // value: PendingWrite[]
+/** Which agent the dispatcher selected for a turn (Cycle 2). See dispatch.ts
+ * on the server and docs/MULTI_AGENT.md. Shared so the client can tag turns. */
+export type AgentKind = 'dairy' | 'vendor' | 'both';
+
+/** CUSTOM event names used as app-specific side-channels over AG-UI. Renamed
+ * from the Cycle 1 `dairy.*` names in Cycle 2: once a vendor write can also
+ * pause a run, `dairy.pending` was misleading. See docs/MULTI_AGENT.md. */
+export const AGENT_DATASET_EVENT = 'agent.dataset'; // value: Dataset
+export const AGENT_MESSAGES_EVENT = 'agent.messages'; // value: AnthropicMessage[]
+export const AGENT_PENDING_EVENT = 'agent.pending'; // value: PendingWrite[]
+export const AGENT_SELECTION_EVENT = 'agent.selection'; // value: AgentKind
 
 // ---------------------------------------------------------------------------
 // Minimal Anthropic message shapes (kept opaque to the client, but typed

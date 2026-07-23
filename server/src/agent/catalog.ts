@@ -1,10 +1,15 @@
-import { allAnimals, allFeed } from '../db';
+import { allAnimals, allFeed, allVendors } from '../db';
 
 export interface Catalog {
   animalCount: number;
   groups: { name: string; count: number }[];
   animalLines: string[];
   feedTypes: string[];
+}
+
+export interface VendorCatalog {
+  vendorCount: number;
+  vendorLines: string[];
 }
 
 /** Build a compact, current snapshot of the farm for the system prompt. */
@@ -30,4 +35,14 @@ export function buildCatalog(): Catalog {
     animalLines,
     feedTypes: feed.map((f) => f.feed_type),
   };
+}
+
+/** Build a compact, current snapshot of the vendors for the vendor agent's
+ * system prompt (mirrors buildCatalog for the dairy side). */
+export function buildVendorCatalog(): VendorCatalog {
+  const vendors = allVendors();
+  const vendorLines = vendors.map(
+    (v) => `${v.id} | ${v.name} — ${v.status} — ${v.price_per_litre}/L`,
+  );
+  return { vendorCount: vendors.length, vendorLines };
 }

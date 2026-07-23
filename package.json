@@ -12,7 +12,10 @@
   "scripts": {
     "build:shared": "npm run build -w shared",
     "seed": "npm run seed -w server",
+    "clean:web-deps-cache": "rm -rf web-angular/.angular/cache/*/web-angular/vite/deps",
+    "predev": "npm run clean:web-deps-cache",
     "dev": "npm run build:shared && concurrently -n server,angular -c blue,red \"npm run dev -w server\" \"npm run start -w web-angular\"",
+    "predev:angular": "npm run clean:web-deps-cache",
     "dev:angular": "npm run build:shared && concurrently -n server,angular -c blue,red \"npm run dev -w server\" \"npm run start -w web-angular\"",
     "build:angular": "npm run build:shared && npm run build -w web-angular",
     "typecheck": "npm run build:shared && npm run typecheck -w server"

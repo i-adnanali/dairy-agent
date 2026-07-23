@@ -22,9 +22,10 @@ import { MessageList } from './message-list';
   template: `
     <div class="mx-auto flex h-full max-w-3xl flex-col">
       <header class="border-b border-farm-200 bg-farm-50/80 px-6 py-4 backdrop-blur">
-        <h1 class="text-lg font-semibold tracking-tight">Dairy Farm Agent</h1>
+        <h1 class="text-lg font-semibold tracking-tight">Baghicha Dairy Co. — Farm Agent</h1>
         <p class="text-sm text-farm-600">
-          Ask about your herd, milk yields, feed, and health — and take actions with confirmation.
+          Ask about your herd, milk, feed, and health, or your vendors, deliveries, and balances —
+          and take actions with confirmation.
         </p>
       </header>
 
